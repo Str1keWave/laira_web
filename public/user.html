@@ -264,7 +264,7 @@
       <div id="videoWrapper">
         <video id="remoteVideo" autoplay playsinline muted></video>
         <audio id="remoteAudio" autoplay></audio>
-        
+
         <!-- Fullscreen toggle button -->
         <button id="fsToggle" class="fs-btn" aria-label="Toggle Fullscreen">
           <!-- Enter-fullscreen icon -->
@@ -874,9 +874,17 @@
           peerConnection.addTransceiver("audio", { direction: "recvonly" });
 
           peerConnection.ontrack = (ev) => {
-            video.srcObject = ev.streams[0];
-            placeholder.style.display = "none";
-          };
+  const stream = ev.streams[0];
+  if (ev.track.kind === "video") {
+    document.getElementById("remoteVideo").srcObject = stream;
+    placeholder.style.display = "none";
+  } else if (ev.track.kind === "audio") {
+    document.getElementById("remoteAudio").srcObject = stream;
+    // optional: unmute or adjust volume here
+    document.getElementById("remoteAudio").volume = 1.0;
+  }
+};
+
           peerConnection.onicecandidate = ({ candidate }) => {
             if (candidate)
               userSocketA.send(
