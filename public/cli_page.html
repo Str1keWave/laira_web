@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>CLI Page</title>
+</head>
+<body>
+  <script>
+    // Establish WebSocket connection to WebSocket B
+    const cliSocket = new WebSocket('wss://' + window.location.hostname + '/forward');
+
+    cliSocket.addEventListener('open', () => {
+      console.log('Connected to WebSocket B as CLI Page');
+    });
+
+    cliSocket.onmessage = async (event) => {
+      try {
+        const data = await (event.data instanceof Blob ? event.data.text() : event.data);
+        const parsedData = JSON.parse(data);
+        console.log(parsedData.message);
+
+        // You can process the data here or pass it to other functions
+      } catch (error) {
+        console.error('Error handling message:', error);
+      }
+    };
+  </script>
+</body>
+</html>

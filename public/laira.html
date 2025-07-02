@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>LaiRA Simulator</title>
+</head>
+<body>
+  <h1>LaiRA Simulator</h1>
+  <!-- Video element to display local video for verification -->
+  <video id="localVideo" autoplay playsinline muted></video>
+
+  <!-- Messaging UI -->
+  <div>
+    <input type="text" id="lairaMessage" placeholder="Enter message for User" />
+    <button id="sendStatusButton">Send Message to User</button>
+  </div>
+  <div>
+    <p id="messageDisplay">Messages will show up here</p>
+  </div>
+
+  <script>
+    // Establish WebSocket connection as LaiRA
+    const laiRASocket = new WebSocket('wss://' + window.location.hostname + '/laiRA');
+    let peerConnection;
+    let remoteDescriptionSet = false;
+    let candidateQueue = [];
+
+    async function startVideoStream() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        document.getElementById('localVideo').srcObject = stream;
+
+        // Fetch TURN credentials dynamically
+        const response = await fetch(
+          "https://laira.metered.live/api/v1/turn/credentials?apiKey=cc105e937e35e7e785bafba97c04621dea2a"
+        );
+        const iceServers = await response.json();
+
+        const config = {
+          iceServers: iceServers,
+          iceTransportPolicy: 'relay' // Force usage of TURN server
+        };
+
+        peerConnection = new RTCPeerConnection(config);
+        console.log("RTCPeerConnection created with dynamic iceServers:", config);
+
+        // Add the local video tracks to the peer connection
+        stream.getTracks().forEach(track => peerConnection.addTrack(track, stream));
+
+        peerConnection.onicecandidate = ({ candidate }) => {
+          if (candidate) {
+            console.log('Sending ICE candidate to User:', candidate);
+            laiRASocket.send(JSON.stringify({
+              type: 'ice-candidate',
+              candidate: candidate.toJSON()
+            }));
+          } else {
+            console.log('All ICE candidates have been sent');
+          }
+        };
+
+        peerConnection.addEventListener('iceconnectionstatechange', () => {
+          console.log('ICE Connection State Change:', peerConnection.iceConnectionState);
+        });
+
+      } catch (error) {
+        console.error("Error starting video stream or initializing peer connection:", error);
+      }
+    }
+
+    laiRASocket.addEventListener('open', () => {
+      console.log('Connected to server as LaiRA');
+      startVideoStream();
+
+      // Notify User that LaiRA is connected
+      laiRASocket.send(JSON.stringify({ type: 'laiRA-connected' }));
+    });
+
+    // Function to send chat message
+    function sendMessage() {
+      const messageText = document.getElementById('lairaMessage').value;
+      const message = {
+        type: 'chat-message',
+        message: messageText
+      };
+      laiRASocket.send(JSON.stringify(message));
+      console.log('Message sent to User:', messageText);
+      document.getElementById('lairaMessage').value = ''; // Clear the input field after sending
+    }
+
+    // Send message on button click
+    document.getElementById('sendStatusButton').addEventListener('click', sendMessage);
+
+    // Send message on Enter key press
+    document.getElementById('lairaMessage').addEventListener('keypress', (event) => {
+      if (event.key === 'Enter') {
+        sendMessage();
+      }
+    });
+
+    // Handle incoming messages from User
+    laiRASocket.onmessage = async (event) => {
+  try {
+    const data = await (event.data instanceof Blob ? event.data.text() : event.data);
+    const parsedData = JSON.parse(data);
+
+    if (parsedData.type === 'offer') {
+      console.log('Received offer from User');
+      if (!peerConnection) {
+        await startVideoStream();
+      }
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(parsedData));
+      remoteDescriptionSet = true;
+
+      // Add any queued ICE candidates
+      for (const candidate of candidateQueue) {
+        await peerConnection.addIceCandidate(candidate);
+      }
+      candidateQueue = [];
+
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
+      laiRASocket.send(JSON.stringify(peerConnection.localDescription));
+      console.log("Sent answer to User:", peerConnection.localDescription);
+    } else if (parsedData.type === 'ice-candidate') {
+      console.log('Received ICE candidate from User:', parsedData.candidate);
+      const candidate = new RTCIceCandidate(parsedData.candidate);
+      if (peerConnection && remoteDescriptionSet) {
+        await peerConnection.addIceCandidate(candidate);
+        console.log("Added ICE candidate to peerConnection");
+      } else {
+        candidateQueue.push(candidate);
+        console.log("Queued ICE candidate");
+      }
+    } else if (parsedData.type === 'chat-message') {
+      document.getElementById('messageDisplay').innerText = parsedData.message;
+    }
+  } catch (error) {
+    console.error("Error handling message from server:", error);
+  }
+};
+
+  </script>
+</body>
+</html>
