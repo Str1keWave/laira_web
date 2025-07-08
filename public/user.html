@@ -873,15 +873,16 @@
           peerConnection.addTransceiver("video", { direction: "recvonly" });
           peerConnection.addTransceiver("audio", { direction: "recvonly" });
 
-          peerConnection.ontrack = (ev) => {
+         peerConnection.ontrack = (ev) => {
   const stream = ev.streams[0];
   if (ev.track.kind === "video") {
     document.getElementById("remoteVideo").srcObject = stream;
     placeholder.style.display = "none";
   } else if (ev.track.kind === "audio") {
-    document.getElementById("remoteAudio").srcObject = stream;
-    // optional: unmute or adjust volume here
-    document.getElementById("remoteAudio").volume = 1.0;
+    const audioElement = document.getElementById("remoteAudio");
+    audioElement.srcObject = stream;
+    audioElement.muted = false;  // Ensure audio is not muted
+    audioElement.volume = 1.0;   // Full volume
   }
 };
 
