@@ -68,6 +68,24 @@
         z-index: 50;
       }
 
+      /* === NEW: audio toggle button === */
+      #audioToggle {
+        position: absolute;
+        top: 0.5rem;
+        left: 0.5rem;
+        padding: 0.4rem 0.8rem;
+        background: rgba(0, 0, 0, 0.55);
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        font-weight: 600;
+        cursor: pointer;
+        z-index: 30;
+      }
+      #audioToggle:hover {
+        background: rgba(255, 255, 255, 0.18);
+      }
+
       /* === p5.js canvas overlay === */
       #p5Canvas {
         position: absolute;
@@ -284,6 +302,9 @@
         <audio id="remoteAudio" autoplay></audio>
         <button id="enableAudio">Enable Audio</button>
 
+        <!-- NEW audio toggle -->
+        <button id="audioToggle">🔇 Mute</button>
+
         <!-- Fullscreen toggle button -->
         <button id="fsToggle" class="fs-btn" aria-label="Toggle Fullscreen">
           <!-- icons omitted for brevity -->
@@ -317,45 +338,31 @@
     </div>
 
     <script>
-       // Global animation stop sending thing
+      // Global animation stop sending thing
       let stopSend = false;
       let rafId = null;
       let aiFollowMode = false;
       let p5Instance = null;
       let objectDetector = null;
       
-      // AI Follow control parameters (EDIT THESE TO ADJUST BEHAVIOR)
-      const horizontalDeadzone = 100; // pixels from center before turning
-      const targetPersonWidth = 350; // target width in video pixels (closer = larger width)
-      const widthDeadzone = 40; // pixels of width difference before moving forward/back
-      let currentAIAction = "searching"; // Current AI action for display
+      // AI Follow control parameters
+      const horizontalDeadzone = 100;
+      const targetPersonWidth = 350;
+      const widthDeadzone = 40;
+      let currentAIAction = "searching";
 
-      // Micro-task helper
-      const nextTick = fn => Promise.resolve().then(fn);
+      const userSocketA = new WebSocket("wss://" + window.location.hostname + "/user");
+      const userSocketB = new WebSocket("wss://" + window.location.hostname + "/forward");
 
-      /* === WebSocket setup === */
-      const userSocketA = new WebSocket(
-        "wss://" + window.location.hostname + "/user"
-      );
-      const userSocketB = new WebSocket(
-        "wss://" + window.location.hostname + "/forward"
-      );
-
-      /* === ICE / WebRTC vars === */
       let peerConnection;
       let remoteDescriptionSet = false;
       let candidateQueue = [];
 
-      /* === Video / placeholder logic === */
       const video = document.getElementById("remoteVideo");
       const placeholder = document.getElementById("placeholder");
 
-      video.addEventListener(
-        "loadedmetadata",
-        () => (placeholder.style.display = "none")
-      );
+      video.addEventListener("loadedmetadata", () => (placeholder.style.display = "none"));
 
-      /* === Fullscreen toggle === */
       const fsBtn = document.getElementById("fsToggle");
       function toggleFullscreen() {
         if (!document.fullscreenElement) {
@@ -367,470 +374,189 @@
       fsBtn.addEventListener("click", toggleFullscreen);
       video.addEventListener("dblclick", toggleFullscreen);
       document.addEventListener("fullscreenchange", () =>
-        document.body.classList.toggle(
-          "fullscreen",
-          !!document.fullscreenElement
-        )
+        document.body.classList.toggle("fullscreen", !!document.fullscreenElement)
       );
 
-      /* === Keyboard streaming === */
-      const keyStates = {
-        w: false,
-        a: false,
-        s: false,
-        d: false,
-        q: false,
-        e: false,
-      };
-      
+      const keyStates = { w: false, a: false, s: false, d: false, q: false, e: false };
+
       function sendKeyStates() {
         if (userSocketA.readyState === WebSocket.OPEN && !aiFollowMode) {
           const ks = {};
           for (const k in keyStates) ks[k] = keyStates[k] ? "True" : "False";
           if (!stopSend) {
-            userSocketA.send(
-              JSON.stringify({
-                type: "chat-message",
-                message: JSON.stringify({ keystates: ks }),
-              })
-            );
+            userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ keystates: ks }) }));
           }
         }
       }
-      
-      function animationLoop(){
-        sendKeyStates();
-        rafId = requestAnimationFrame(animationLoop);
-      }
+      function animationLoop(){ sendKeyStates(); rafId = requestAnimationFrame(animationLoop); }
+      userSocketA.addEventListener("open", () => { rafId = requestAnimationFrame(animationLoop); });
 
-      /* start it once */
-      userSocketA.addEventListener("open", () => {
-        rafId = requestAnimationFrame(animationLoop);
-      });
-      
       document.addEventListener("keydown", e=>{
         const k=e.key.toLowerCase();
-         if (e.key.toLowerCase() === 'l' && !aiFollowMode) {
-    // Prevent triggering if in AI Follow mode
-    runCustomAnimations('lie down');
-  }
+        if (e.key.toLowerCase() === 'l' && !aiFollowMode) runCustomAnimations('lie down');
         if(k in keyStates && !aiFollowMode){
-          if(stopSend){
-            stopSend = false;
-            rafId = requestAnimationFrame(animationLoop);
-          }
+          if(stopSend){ stopSend = false; rafId = requestAnimationFrame(animationLoop); }
           keyStates[k] = true;
         }
       });
-      
-      document.addEventListener("keyup", (e) => {
-        const k = e.key.toLowerCase();
-        if (k in keyStates && !aiFollowMode) keyStates[k] = false;
-      });
+      document.addEventListener("keyup", (e) => { const k = e.key.toLowerCase(); if (k in keyStates && !aiFollowMode) keyStates[k] = false; });
 
-      /* === Text command bar === */
       function sendText() {
-        if (aiFollowMode) return; // Disable text sending in AI follow mode
+        if (aiFollowMode) return;
         const txt = document.getElementById("userMessage").value.trim();
         if (txt) {
-          userSocketA.send(
-            JSON.stringify({ type: "chat-message", message: txt })
-          );
+          userSocketA.send(JSON.stringify({ type: "chat-message", message: txt }));
           document.getElementById("userMessage").value = "";
         }
       }
-      document
-        .getElementById("sendCommandButton")
-        .addEventListener("click", sendText);
-      document
-        .getElementById("userMessage")
-        .addEventListener("keydown", (e) => {
-          if (e.key === "Enter") sendText();
-        });
+      document.getElementById("sendCommandButton").addEventListener("click", sendText);
+      document.getElementById("userMessage").addEventListener("keydown", (e) => { if (e.key === "Enter") sendText(); });
 
-      /* === Side command buttons === */
-      document
-        .querySelectorAll(".side-btn[data-cmd]")
-        .forEach((btn) =>
-          btn.addEventListener("click", () => {
-            if (!aiFollowMode) {
-              runCustomAnimations(btn.dataset.cmd);
-            }
-          })
-        );
+      document.querySelectorAll(".side-btn[data-cmd]").forEach((btn) =>
+        btn.addEventListener("click", () => { if (!aiFollowMode) { runCustomAnimations(btn.dataset.cmd); } })
+      );
 
-      /* === AI Follow Mode Toggle === */
       const aiFollowBtn = document.getElementById("aiFollowBtn");
       aiFollowBtn.addEventListener("click", toggleAIFollowMode);
 
       function toggleAIFollowMode() {
         aiFollowMode = !aiFollowMode;
-        
         if (aiFollowMode) {
-          
-          userSocketA.send(
-                          JSON.stringify({
-                            type: "chat-message",
-                            message: JSON.stringify({ aimode: 'hi' }),
-                          })
-                        );
-          // Activate AI Follow Mode
+          userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ aimode: 'hi' }) }));
           document.body.classList.add("ai-follow-active");
           aiFollowBtn.classList.add("active");
-          
-          // Disable other buttons
-          document.querySelectorAll(".side-btn[data-cmd]").forEach(btn => {
-            btn.classList.add("disabled");
-          });
+          document.querySelectorAll(".side-btn[data-cmd]").forEach(btn => { btn.classList.add("disabled"); });
           document.getElementById("sendCommandButton").classList.add("disabled");
           document.getElementById("userMessage").disabled = true;
-          
-          // Stop key sending
-          if (rafId !== null) {
-            cancelAnimationFrame(rafId);
-            rafId = null;
-          }
+          if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
           stopSend = true;
-          
-          // Reset all keys to false
           for (const k in keyStates) keyStates[k] = false;
-          
-          // Start p5.js for person detection
           startP5PersonDetection();
-          
         } else {
-          
-          userSocketA.send(
-                          JSON.stringify({
-                            type: "chat-message",
-                            message: JSON.stringify({ noaimode: 'bye' }),
-                          })
-                        );
-          // Deactivate AI Follow Mode
+          userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ noaimode: 'bye' }) }));
           document.body.classList.remove("ai-follow-active");
           aiFollowBtn.classList.remove("active");
-          
-          // Enable other buttons
-          document.querySelectorAll(".side-btn[data-cmd]").forEach(btn => {
-            btn.classList.remove("disabled");
-          });
+          document.querySelectorAll(".side-btn[data-cmd]").forEach(btn => { btn.classList.remove("disabled"); });
           document.getElementById("sendCommandButton").classList.remove("disabled");
           document.getElementById("userMessage").disabled = false;
-          
-          // Send stop command before disabling AI
           if (userSocketA.readyState === WebSocket.OPEN) {
-            userSocketA.send(
-              JSON.stringify({
-                type: "chat-message",
-                message: JSON.stringify({ 
-                  keystates: {
-                    w: "False", a: "False", s: "False", 
-                    d: "False", q: "False", e: "False"
-                  }
-                }),
-              })
-            );
+            userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ keystates: { w:"False",a:"False",s:"False",d:"False",q:"False",e:"False" } }) }));
           }
-          
-          // Stop p5.js
           stopP5PersonDetection();
-          
-          // Resume key sending
           stopSend = false;
           rafId = requestAnimationFrame(animationLoop);
         }
       }
 
-      /* === p5.js Person Detection === */
       function startP5PersonDetection() {
         const sketch = function(p) {
           let detections = [];
           let canvas;
-          
           p.setup = function() {
-            // Get video dimensions
-            const videoWrapper = document.getElementById('videoWrapper');
             const videoElement = document.getElementById('remoteVideo');
-            
-            // Create canvas matching video size
             canvas = p.createCanvas(videoElement.clientWidth, videoElement.clientHeight);
-            canvas.parent('videoWrapper');
-            canvas.id('p5Canvas');
-            
-            // Initialize COCO-SSD object detector
-            objectDetector = ml5.objectDetector('cocossd', {}, function() {
-              console.log('Object detector loaded');
-              detectObjects();
-            });
+            canvas.parent('videoWrapper'); canvas.id('p5Canvas');
+            objectDetector = ml5.objectDetector('cocossd', {}, function() { console.log('Object detector loaded'); detectObjects(); });
           };
-          
           p.draw = function() {
             p.clear();
-            
-            // Draw rectangles around detected persons
             for (let detection of detections) {
               if (detection.label === 'person') {
-                p.noFill();
-                p.stroke(255, 0, 0);
-                p.strokeWeight(3);
-                
-                // Scale detection coordinates to canvas size
+                p.noFill(); p.stroke(255, 0, 0); p.strokeWeight(3);
                 const videoElement = document.getElementById('remoteVideo');
                 const scaleX = p.width / videoElement.videoWidth;
                 const scaleY = p.height / videoElement.videoHeight;
-                
-                p.rect(
-                  detection.x * scaleX,
-                  detection.y * scaleY,
-                  detection.width * scaleX,
-                  detection.height * scaleY
-                );
+                p.rect(detection.x * scaleX,detection.y * scaleY,detection.width * scaleX,detection.height * scaleY);
               }
             }
           };
-          
-          p.windowResized = function() {
-            const videoElement = document.getElementById('remoteVideo');
-            p.resizeCanvas(videoElement.clientWidth, videoElement.clientHeight);
-          };
-          
           function detectObjects() {
             if (!aiFollowMode || !objectDetector) return;
-            
             const videoElement = document.getElementById('remoteVideo');
-            if (videoElement.readyState >= 2) { // Has enough data
+            if (videoElement.readyState >= 2) {
               objectDetector.detect(videoElement, function(err, results) {
                 if (!err && results) {
                   detections = results;
-                  
-                  // Process detections for AI control
                   let personDetected = false;
                   for (let detection of detections) {
                     if (detection.label === 'person') {
                       personDetected = true;
-                      
-                      // Calculate person center and width
                       const personCenterX = detection.x + (detection.width / 2);
                       const videoCenterX = videoElement.videoWidth / 2;
                       const horizontalOffset = personCenterX - videoCenterX;
                       const personWidth = detection.width;
-                      
-                      // Determine AI action based on position
-                      let aiKeystates = {
-                        w: false, a: false, s: false, d: false, q: false, e: false
-                      };
+                      let aiKeystates = { w:false,a:false,s:false,d:false,q:false,e:false };
                       let action = "tracking";
-                      
-                      // Check horizontal position with deadzone
                       if (Math.abs(horizontalOffset) > horizontalDeadzone) {
-                        if (horizontalOffset > 0) {
-                          // Person is to the right, turn right
-                          aiKeystates.d = true;
-                          action = "turning right";
-                        } else {
-                          // Person is to the left, turn left
-                          aiKeystates.a = true;
-                          action = "turning left";
-                        }
+                        if (horizontalOffset > 0) { aiKeystates.d = true; action = "turning right"; }
+                        else { aiKeystates.a = true; action = "turning left"; }
                       } else {
-                        // Within horizontal deadzone, check distance
                         const widthDifference = personWidth - targetPersonWidth;
-                        
                         if (Math.abs(widthDifference) > widthDeadzone) {
-                          if (widthDifference < 0) {
-                            // Person is far (width too small), move forward
-                            aiKeystates.w = true;
-                            action = "moving forward";
-                          } else {
-                            // Person is close (width too large), move backward
-                            aiKeystates.s = true;
-                            action = "moving backward";
-                          }
-                        } else {
-                          // Within both deadzones, just tracking
-                          action = "tracking";
+                          if (widthDifference < 0) { aiKeystates.w = true; action = "moving forward"; }
+                          else { aiKeystates.s = true; action = "moving backward"; }
                         }
                       }
-                      
-                      // Update status display
-                      currentAIAction = action;
-                      document.getElementById('aiAction').textContent = action.charAt(0).toUpperCase() + action.slice(1);
-                      
-                      // Send AI control commands
+                      currentAIAction = action; document.getElementById('aiAction').textContent = action.charAt(0).toUpperCase() + action.slice(1);
                       if (userSocketA.readyState === WebSocket.OPEN) {
-                        const ks = {};
-                        for (const k in aiKeystates) {
-                          ks[k] = aiKeystates[k] ? "True" : "False";
-                        }
-                        userSocketA.send(
-                          JSON.stringify({
-                            type: "chat-message",
-                            message: JSON.stringify({ keystates: ks }),
-                          })
-                        );
+                        const ks = {}; for (const k in aiKeystates) ks[k] = aiKeystates[k] ? "True" : "False";
+                        userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ keystates: ks }) }));
                       }
-                      
-                      break; // Only track first person detected
+                      break;
                     }
                   }
-                  
                   if (!personDetected) {
-                    // No person detected, stop movement
-                    currentAIAction = "searching";
-                    document.getElementById('aiAction').textContent = "Searching";
-                    
-                    // Send stop command
+                    currentAIAction = "searching"; document.getElementById('aiAction').textContent = "Searching";
                     if (userSocketA.readyState === WebSocket.OPEN) {
-                      userSocketA.send(
-                        JSON.stringify({
-                          type: "chat-message",
-                          message: JSON.stringify({ 
-                            keystates: {
-                              w: "False", a: "False", s: "False", 
-                              d: "False", q: "False", e: "False"
-                            }
-                          }),
-                        })
-                      );
+                      userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ keystates: { w:"False",a:"False",s:"False",d:"False",q:"False",e:"False" } }) }));
                     }
                   }
                 }
-                // Continue detecting
-                if (aiFollowMode) {
-                  setTimeout(detectObjects, 100); // Detect every 100ms
-                }
+                if (aiFollowMode) { setTimeout(detectObjects, 100); }
               });
-            } else {
-              // Video not ready, try again
-              setTimeout(detectObjects, 500);
-            }
+            } else { setTimeout(detectObjects, 500); }
           }
         };
-        
         p5Instance = new p5(sketch);
       }
-      
-      function stopP5PersonDetection() {
-        if (p5Instance) {
-          p5Instance.remove();
-          p5Instance = null;
-        }
-        objectDetector = null;
-      }
+      function stopP5PersonDetection() { if (p5Instance) { p5Instance.remove(); p5Instance = null; } objectDetector = null; }
 
       function runCustomAnimations(cmd){
-        /* cancel whatever frame is already waiting */
-        if(rafId!==null){
-          cancelAnimationFrame(rafId);
-          rafId = null;
-        }
-
+        if(rafId!==null){ cancelAnimationFrame(rafId); rafId = null; }
         stopSend = true;
-
-        /* send packets right away (no timeout needed) */
-        userSocketA.send(JSON.stringify({
-          type:"chat-message",
-          message: JSON.stringify({ keystates:{
-            w:false,a:false,s:false,d:false,q:false,e:false
-          }})
-        }));
-
-        if(cmd==="dock"){
-          userSocketA.send(JSON.stringify({
-            type:"chat-message",
-            message: JSON.stringify({ ik:[[60,0,0],[60,0,0],[60,0,0],[60,0,0]] })
-          }));
-        }else if(cmd==="sit"){
-          userSocketA.send(JSON.stringify({
-            type:"chat-message",
-            message: JSON.stringify({ angle:[[90,172,142],[90,200,50],[90,170,144],[90,200,50]] })
-          }));
-        }
-        else if(cmd==="roll"){
-          userSocketA.send(JSON.stringify({
-            type:"chat-message",
-            message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[90,200,135],[90,200,135]] })
-          }));
-          setTimeout(() => {
-            userSocketA.send(JSON.stringify({
-              type:"chat-message",
-              message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[140,100,135],[140,100,135]] })
-            }));
-          }, 500);
-          setTimeout(() => {
-            userSocketA.send(JSON.stringify({
-              type:"chat-message",
-              message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[140,100,0],[140,100,0]] })
-            }));
-          }, 500);
-        }
-        else if(cmd==="lie down"){
-          userSocketA.send(JSON.stringify({
-            type:"chat-message",
-            message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[90,200,135],[90,200,135]] })
-          }));
-          setTimeout(() => {
-            userSocketA.send(JSON.stringify({
-              type: "chat-message",
-              message: JSON.stringify({ action: "rest" })
-            }));
-          }, 500);
-        }
+        userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ keystates:{w:false,a:false,s:false,d:false,q:false,e:false} }) }));
+        if(cmd==="dock"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ ik:[[60,0,0],[60,0,0],[60,0,0],[60,0,0]] }) })); }
+        else if(cmd==="sit"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,172,142],[90,200,50],[90,170,144],[90,200,50]] }) })); }
+        else if(cmd==="roll"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[90,200,135],[90,200,135]] }) })); setTimeout(() => { userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[140,100,135],[140,100,135]] }) })); }, 500); setTimeout(() => { userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[140,100,0],[140,100,0]] }) })); }, 500); }
+        else if(cmd==="lie down"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[90,200,135],[90,200,135]] }) })); setTimeout(() => { userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ action: "rest" }) })); }, 500); }
       }
 
-      /* === WebSocket hooks === */
-      userSocketA.addEventListener("open", () => {
-        console.log("Socket A connected");
-      });
-      userSocketB.addEventListener("open", () =>
-        console.log("Socket B connected")
-      );
+      userSocketA.addEventListener("open", () => { console.log("Socket A connected"); });
+      userSocketB.addEventListener("open", () => console.log("Socket B connected"));
       let handshakeTimer = null;
       userSocketA.addEventListener("message", async (event) => {
         try {
-          const data = await (event.data instanceof Blob
-            ? event.data.text()
-            : event.data);
+          const data = await (event.data instanceof Blob ? event.data.text() : event.data);
           const parsed = JSON.parse(data);
-
           if (parsed.type === "laiRA-connected") {
-            console.log("🔔 got laiRA-connected");
-            // clear any pending handshake
             if (handshakeTimer) clearTimeout(handshakeTimer);
-
-            // wait a brief moment for duplicates to arrive, then do one handshake
             handshakeTimer = setTimeout(() => {
               handshakeTimer = null;
-
-              // clean up any stale PC
-              if (peerConnection) {
-                console.log("🗑 closing old PeerConnection");
-                peerConnection.close();
-                peerConnection = null;
-                remoteDescriptionSet = false;
-                candidateQueue = [];
-              }
-
+              if (peerConnection) { console.log("🗑 closing old PeerConnection"); peerConnection.close(); peerConnection = null; remoteDescriptionSet = false; candidateQueue = []; }
               console.log("🚀 starting new handshake");
               startPeerConnection();
-            }, 200);  // 200 ms debounce window
+            }, 200);
           } else if (parsed.type === "answer") {
             await peerConnection.setRemoteDescription(parsed);
             remoteDescriptionSet = true;
-            for (const c of candidateQueue)
-              await peerConnection.addIceCandidate(c);
+            for (const c of candidateQueue) await peerConnection.addIceCandidate(c);
             candidateQueue = [];
           } else if (parsed.type === "ice-candidate") {
             const cand = new RTCIceCandidate(parsed.candidate);
-            if (remoteDescriptionSet)
-              await peerConnection.addIceCandidate(cand);
+            if (remoteDescriptionSet) await peerConnection.addIceCandidate(cand);
             else candidateQueue.push(cand);
-          } else if (parsed.type === "chat-message") {
-            userSocketB.send(JSON.stringify(parsed));
-          }
-        } catch (err) {
-          console.error("Error handling message", err);
-        }
+          } else if (parsed.type === "chat-message") { userSocketB.send(JSON.stringify(parsed)); }
+        } catch (err) { console.error("Error handling message", err); }
       });
 
       async function startPeerConnection() {
@@ -849,27 +575,38 @@
             } else if (ev.track.kind === "audio") {
               const audioEl = document.getElementById("remoteAudio");
               audioEl.srcObject = stream;
-              try {
-                await audioEl.play();
-                document.getElementById("enableAudio").style.display = "none";
-              } catch {
-                document.getElementById("enableAudio").style.display = "block";
-              }
+              console.log("🎵 Received remote audio track, stream attached.");
             }
           };
 
-          document.getElementById("enableAudio").onclick = async () => {
-            try {
-              await document.getElementById("remoteAudio").play();
-              document.getElementById("enableAudio").style.display = "none";
-            } catch (e) {
-              console.error("Enable audio failed:", e);
+          const audioEl = document.getElementById("remoteAudio");
+          const audioToggle = document.getElementById("audioToggle");
+          let audioEnabled = true;
+          audioToggle.onclick = async () => {
+            if (!audioEl.srcObject) {
+              console.warn("No audio stream yet.");
+              return;
             }
+            if (audioEnabled) {
+              audioEl.muted = true;
+              audioEl.pause();
+              audioToggle.textContent = "🔈 Unmute";
+              console.log("🔇 Audio muted/paused by user.");
+            } else {
+              try {
+                await audioEl.play();
+                audioEl.muted = false;
+                audioToggle.textContent = "🔇 Mute";
+                console.log("🔈 Audio resumed/unmuted by user.");
+              } catch (e) {
+                console.error("Audio resume failed:", e);
+              }
+            }
+            audioEnabled = !audioEnabled;
           };
 
           peerConnection.onicecandidate = ({ candidate }) => {
-            if (candidate)
-              userSocketA.send(JSON.stringify({ type: "ice-candidate", candidate: candidate.toJSON() }));
+            if (candidate) userSocketA.send(JSON.stringify({ type: "ice-candidate", candidate: candidate.toJSON() }));
           };
 
           const offer = await peerConnection.createOffer();
@@ -882,4 +619,3 @@
     </script>
   </body>
 </html>
-
