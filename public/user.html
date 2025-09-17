@@ -299,11 +299,11 @@
     <div id="app">
       <div id="videoWrapper">
         <video id="remoteVideo" autoplay playsinline muted></video>
-        <audio id="remoteAudio" autoplay></audio>
+        <audio id="remoteAudio" autoplay muted></audio>
         <button id="enableAudio">Enable Audio</button>
 
         <!-- NEW audio toggle -->
-        <button id="audioToggle">🔇 Mute</button>
+        <button id="audioToggle">🔇 Muted</button>
 
         <!-- Fullscreen toggle button -->
         <button id="fsToggle" class="fs-btn" aria-label="Toggle Fullscreen">
@@ -321,7 +321,7 @@
       <button class="side-btn" data-cmd="dock">Dock</button>
       <button class="side-btn" data-cmd="sit">Sit</button>
       <button class="side-btn" data-cmd="lie down">Lie&nbsp;Down</button>
-      <button class="side-btn" data-cmd="roll">Roll</button>
+      <button class="side-btn" data-cmd="shake">Shake</button>
       <button id="aiFollowBtn" class="side-btn">AI&nbsp;Follow</button>
     </div>
 
@@ -527,7 +527,7 @@
         userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ keystates:{w:false,a:false,s:false,d:false,q:false,e:false} }) }));
         if(cmd==="dock"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ ik:[[60,0,0],[60,0,0],[60,0,0],[60,0,0]] }) })); }
         else if(cmd==="sit"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,172,142],[90,200,50],[90,170,144],[90,200,50]] }) })); }
-        else if(cmd==="roll"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[90,200,135],[90,200,135]] }) })); setTimeout(() => { userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[140,100,135],[140,100,135]] }) })); }, 500); setTimeout(() => { userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[140,100,0],[140,100,0]] }) })); }, 500); }
+        else if(cmd==="shake"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,182,152],[90,200,50],[90,170,144],[90,200,50]] }) })); })); setTimeout(() => { userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ action: "shake" }) })); }, 500); }
         else if(cmd==="lie down"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[90,200,135],[90,200,135]] }) })); setTimeout(() => { userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ action: "rest" }) })); }, 500); }
       }
 
@@ -581,7 +581,7 @@
 
           const audioEl = document.getElementById("remoteAudio");
           const audioToggle = document.getElementById("audioToggle");
-          let audioEnabled = true;
+          let audioEnabled = false;
           audioToggle.onclick = async () => {
             if (!audioEl.srcObject) {
               console.warn("No audio stream yet.");
@@ -590,13 +590,13 @@
             if (audioEnabled) {
               audioEl.muted = true;
               audioEl.pause();
-              audioToggle.textContent = "🔈 Unmute";
+              audioToggle.textContent = "🔇 Muted";
               console.log("🔇 Audio muted/paused by user.");
             } else {
               try {
                 await audioEl.play();
                 audioEl.muted = false;
-                audioToggle.textContent = "🔇 Mute";
+                audioToggle.textContent = "🔈 Unmuted";
                 console.log("🔈 Audio resumed/unmuted by user.");
               } catch (e) {
                 console.error("Audio resume failed:", e);
