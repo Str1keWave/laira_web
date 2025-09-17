@@ -520,14 +520,14 @@
         p5Instance = new p5(sketch);
       }
       function stopP5PersonDetection() { if (p5Instance) { p5Instance.remove(); p5Instance = null; } objectDetector = null; }
-
+//[back left leg],[front leg],[back right leg],[front leg]
       function runCustomAnimations(cmd){
         if(rafId!==null){ cancelAnimationFrame(rafId); rafId = null; }
         stopSend = true;
         userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ keystates:{w:false,a:false,s:false,d:false,q:false,e:false} }) }));
         if(cmd==="dock"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ ik:[[60,0,0],[60,0,0],[60,0,0],[60,0,0]] }) })); }
         else if(cmd==="sit"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,172,142],[90,200,50],[90,170,144],[90,200,50]] }) })); }
-        else if(cmd==="shake"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,182,152],[90,200,50],[90,170,144],[90,200,50]] }) })); setTimeout(() => { userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ action: "shake" }) })); }, 500); }
+        else if(cmd==="shake"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,172,142],[90,270,50],[90,170,144],[90,200,50]] }) })); setTimeout(() => { userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ action: "shake" }) })); }, 500); }
         else if(cmd==="lie down"){ userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[90,200,135],[90,200,135]] }) })); setTimeout(() => { userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ action: "rest" }) })); }, 500); }
       }
 
