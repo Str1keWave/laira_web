@@ -13,7 +13,7 @@
     "express": "^4.21.1",
     "fastify": "^4.21.0",
     "handlebars": "^4.7.8",
-    "ws": "^8.13.0"
+    "ws": "^8.13.0",
     "revai-node-sdk": "^2.12.0"
   },
   "engines": {
