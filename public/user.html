@@ -551,6 +551,8 @@
             remoteDescriptionSet = true;
             for (const c of candidateQueue) await peerConnection.addIceCandidate(c);
             candidateQueue = [];
+          } else if (parsed.type === "voice-transcript") {
+            console.log("🎤 Final transcript:", parsed.data);
           } else if (parsed.type === "ice-candidate") {
             const cand = new RTCIceCandidate(parsed.candidate);
             if (remoteDescriptionSet) await peerConnection.addIceCandidate(cand);
@@ -592,18 +594,72 @@
               audioEl.pause();
               audioToggle.textContent = "🔇 Muted";
               console.log("🔇 Audio muted/paused by user.");
+              stopAudioStreaming();
             } else {
               try {
                 await audioEl.play();
                 audioEl.muted = false;
                 audioToggle.textContent = "🔈 Unmuted";
                 console.log("🔈 Audio resumed/unmuted by user.");
+                startAudioStreaming();
               } catch (e) {
                 console.error("Audio resume failed:", e);
               }
             }
             audioEnabled = !audioEnabled;
           };
+
+          let audioWS = null;
+          let audioCtx, processor;
+          
+          function startAudioStreaming() {
+            if (audioWS) return;
+            audioWS = new WebSocket("wss://" + window.location.hostname + "/audio-stream");
+            audioWS.binaryType = "arraybuffer";
+          
+            audioWS.onopen = () => {
+              console.log("🔊 Audio stream socket open");
+              audioCtx = new AudioContext({ sampleRate: 16000 });
+              const src = audioCtx.createMediaElementSource(document.getElementById("remoteAudio"));
+              processor = audioCtx.createScriptProcessor(4096, 1, 1);
+              src.connect(processor);
+              processor.connect(audioCtx.destination);
+              processor.onaudioprocess = (e) => {
+                const input = e.inputBuffer.getChannelData(0);
+                // Convert Float32 → Int16 PCM
+                const buffer = new ArrayBuffer(input.length * 2);
+                const view = new DataView(buffer);
+                let offset = 0;
+                for (let i = 0; i < input.length; i++, offset += 2) {
+                  let s = Math.max(-1, Math.min(1, input[i]));
+                  view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+                }
+                if (audioWS && audioWS.readyState === WebSocket.OPEN) {
+                  audioWS.send(buffer);
+                }
+              };
+            };
+          
+            audioWS.onmessage = (ev) => {
+              // Not strictly needed, since transcripts are forwarded over userSocketA
+              console.log("AudioWS:", ev.data);
+            };
+          
+            audioWS.onclose = () => {
+              console.log("Audio stream socket closed");
+              if (processor) processor.disconnect();
+              if (audioCtx) audioCtx.close();
+              audioWS = null;
+            };
+          }
+          
+          function stopAudioStreaming() {
+            if (audioWS) {
+              audioWS.close();
+              audioWS = null;
+            }
+          }
+
 
           peerConnection.onicecandidate = ({ candidate }) => {
             if (candidate) userSocketA.send(JSON.stringify({ type: "ice-candidate", candidate: candidate.toJSON() }));
