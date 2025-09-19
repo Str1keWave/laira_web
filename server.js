@@ -114,7 +114,7 @@ wss.on('connection', (ws, req) => {
   const audioConfig = new revai.AudioConfig(
     "audio/x-raw",   // MIME
     "interleaved",   // layout
-    16000,           // sample rate Hz (make sure you downsample in browser)
+    48000,           // sample rate Hz 
     "S16LE",         // format
     1                // channels
   );
