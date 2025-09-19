@@ -613,45 +613,55 @@
           let audioCtx, processor;
           
           function startAudioStreaming() {
-            if (audioWS) return;
-            audioWS = new WebSocket("wss://" + window.location.hostname + "/audio-stream");
-            audioWS.binaryType = "arraybuffer";
-          
-            audioWS.onopen = () => {
-              console.log("🔊 Audio stream socket open");
-              audioCtx = new AudioContext({ sampleRate: 16000 });
-              const src = audioCtx.createMediaElementSource(document.getElementById("remoteAudio"));
-              processor = audioCtx.createScriptProcessor(4096, 1, 1);
-              src.connect(processor);
-              processor.connect(audioCtx.destination);
-              processor.onaudioprocess = (e) => {
-                const input = e.inputBuffer.getChannelData(0);
-                // Convert Float32 → Int16 PCM
-                const buffer = new ArrayBuffer(input.length * 2);
-                const view = new DataView(buffer);
-                let offset = 0;
-                for (let i = 0; i < input.length; i++, offset += 2) {
-                  let s = Math.max(-1, Math.min(1, input[i]));
-                  view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-                }
-                if (audioWS && audioWS.readyState === WebSocket.OPEN) {
-                  audioWS.send(buffer);
-                }
-              };
-            };
-          
-            audioWS.onmessage = (ev) => {
-              // Not strictly needed, since transcripts are forwarded over userSocketA
-              console.log("AudioWS:", ev.data);
-            };
-          
-            audioWS.onclose = () => {
-              console.log("Audio stream socket closed");
-              if (processor) processor.disconnect();
-              if (audioCtx) audioCtx.close();
-              audioWS = null;
-            };
-          }
+  if (audioWS) return;
+  audioWS = new WebSocket("wss://" + window.location.hostname + "/audio-stream");
+  audioWS.binaryType = "arraybuffer";
+
+  audioWS.onopen = () => {
+    console.log("🔊 Audio stream socket open");
+
+    const remoteStream = document.getElementById("remoteAudio").srcObject;
+    audioCtx = new AudioContext(); // default 48k
+    const src = audioCtx.createMediaStreamSource(remoteStream);
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+    src.connect(processor);
+    processor.connect(audioCtx.destination);
+
+    processor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+
+      // Downsample from 48k → 16k
+      const ratio = 48000 / 16000;
+      const length = Math.floor(input.length / ratio);
+      const downsampled = new Float32Array(length);
+      for (let i = 0; i < length; i++) {
+        downsampled[i] = input[Math.floor(i * ratio)];
+      }
+
+      // Convert Float32 → Int16 PCM
+      const buffer = new ArrayBuffer(downsampled.length * 2);
+      const view = new DataView(buffer);
+      let offset = 0;
+      for (let i = 0; i < downsampled.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, downsampled[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      }
+
+      if (audioWS && audioWS.readyState === WebSocket.OPEN) {
+        audioWS.send(buffer);
+      }
+    };
+  };
+
+  audioWS.onclose = () => {
+    console.log("Audio stream socket closed");
+    if (processor) processor.disconnect();
+    if (audioCtx) audioCtx.close();
+    audioWS = null;
+  };
+}
+
           
           function stopAudioStreaming() {
             if (audioWS) {
