@@ -1,6 +1,7 @@
 const express = require('express');
 const WebSocket = require('ws');
 const app = express();
+const revai = require('revai-node-sdk');
 
 app.use(express.static('public'));
 
@@ -106,7 +107,55 @@ wss.on('connection', (ws, req) => {
       console.log('Forward client disconnected');
       forwardSocketSet.delete(ws);
     });
-  }
+  } else if (req.url === '/audio-stream') {
+  console.log('Audio stream connected');
+
+  // Configure Rev.ai audio
+  const audioConfig = new revai.AudioConfig(
+    "audio/x-raw",   // MIME
+    "interleaved",   // layout
+    16000,           // sample rate Hz (make sure you downsample in browser)
+    "S16LE",         // format
+    1                // channels
+  );
+
+  const token = process.env.REVAI_ACCESS_TOKEN; // set this in env
+  const client = new revai.RevAiStreamingClient(token, audioConfig);
+  const revStream = client.start();
+
+  // Forward Rev.ai transcripts back to user.html
+  revStream.on('data', (data) => {
+    try {
+      const parsed = JSON.parse(data.toString());
+      if (parsed.type === "final" && userSocket && userSocket.readyState === WebSocket.OPEN) {
+        userSocket.send(JSON.stringify({ type: "voice-transcript", data: parsed }));
+      }
+    } catch (err) {
+      console.error("Error parsing Rev.ai data", err, data.toString());
+    }
+  });
+
+  revStream.on('end', () => {
+    console.log("Rev.ai stream ended");
+  });
+
+  ws.on('message', (message, isBinary) => {
+    if (isBinary) {
+      // PCM audio chunk
+      revStream.write(message);
+    } else {
+      console.log("Non-binary message on /audio-stream", message.toString());
+    }
+  });
+
+  ws.on('close', () => {
+    console.log("Audio stream disconnected");
+    client.end();
+  });
+}
+
+
+  
 });
 
 // Function to forward only chat messages to CLI clients
