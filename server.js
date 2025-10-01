@@ -9,6 +9,9 @@ app.use(express.static('public'));
 app.get('/user', (req, res) => {
   res.sendFile(__dirname + '/public/user.html');
 });
+app.get('/user2', (req, res) => {
+  res.sendFile(__dirname + '/public/user2.html');
+});
 app.get('/laira', (req, res) => {
   res.sendFile(__dirname + '/public/laira.html');
 });
