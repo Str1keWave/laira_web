@@ -602,7 +602,7 @@
                 audioToggle.textContent = "🔈 Unmuted";
                 console.log("🔈 Audio resumed/unmuted by user.");
                 if (!audioHasBeenOnBefore){
-                  const audioCtx = new AudioContext();
+                  const audioCtx = new AudioContext({ sampleRate: 16000 });
                   const source = audioCtx.createMediaStreamSource(stream);
                   //nothing yet, yet to add stuff
                   
