@@ -353,6 +353,7 @@
 
       const userSocketA = new WebSocket("wss://" + window.location.hostname + "/user");
       const userSocketB = new WebSocket("wss://" + window.location.hostname + "/forward");
+      const whisperSocket = new WebSocket("wss://api.openai.com/v1/realtime?intent=transcription");
 
       let peerConnection;
       let remoteDescriptionSet = false;
@@ -582,6 +583,7 @@
           const audioEl = document.getElementById("remoteAudio");
           const audioToggle = document.getElementById("audioToggle");
           let audioEnabled = false;
+          let audioHasBeenOnBefore = false;
           audioToggle.onclick = async () => {
             if (!audioEl.srcObject) {
               console.warn("No audio stream yet.");
@@ -596,8 +598,19 @@
               try {
                 await audioEl.play();
                 audioEl.muted = false;
+                
                 audioToggle.textContent = "🔈 Unmuted";
                 console.log("🔈 Audio resumed/unmuted by user.");
+                if (!audioHasBeenOnBefore){
+                  const audioCtx = new AudioContext();
+                  const source = audioCtx.createMediaStreamSource(stream);
+                  //nothing yet, yet to add stuff
+                  
+                
+                }
+
+                audioHasBeenOnBefore = true
+
               } catch (e) {
                 console.error("Audio resume failed:", e);
               }
