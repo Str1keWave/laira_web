@@ -605,7 +605,7 @@
                   const audioCtx = new AudioContext({ sampleRate: 16000 });
                   await ctx.audioWorklet.addModule('pcm-processor.js');
                   
-                  const source = audioCtx.createMediaStreamSource(stream);
+                  const source = audioCtx.createMediaStreamSource(audioEl.srcObject);
                   const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
 
                   workletNode.port.onmessage = (event) => {
