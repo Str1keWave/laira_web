@@ -603,8 +603,23 @@
                 console.log("🔈 Audio resumed/unmuted by user.");
                 if (!audioHasBeenOnBefore){
                   const audioCtx = new AudioContext({ sampleRate: 16000 });
+                  await ctx.audioWorklet.addModule('pcm-processor.js');
+                  
                   const source = audioCtx.createMediaStreamSource(stream);
+                  const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
+
+                  workletNode.port.onmessage = (event) => {
+                  const pcm16 = new Int16Array(event.data); // one chunk of PCM16 samples
+                    base64Converted = btoa(pcm16)
+                    
+                  // TODO: Base64 encode pcm16.buffer and send over your transcription WebSocket
+                };
+                  
+                  source.connect(workletNode);
+
+                  
                   //nothing yet, yet to add stuff
+                  
                   
                 
                 }
