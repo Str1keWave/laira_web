@@ -336,7 +336,7 @@
       <input id="userMessage" placeholder="Send a message to LaiRA..." autocomplete="off" />
       <button id="sendCommandButton">Send</button>
     </div>
-
+    
     <script>
       // Global animation stop sending thing
       let stopSend = false;
@@ -616,6 +616,13 @@
           console.error("Peer connection error", err);
         }
       }
+      // heartbeat loop
+setInterval(() => {
+  if (userSocketA.readyState === WebSocket.OPEN) {
+    userSocketA.send(JSON.stringify({ type: "keepalive" }));
+  }
+}, 55000); // every 55 seconds
+
     </script>
   </body>
 </html>
