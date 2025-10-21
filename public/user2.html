@@ -353,7 +353,6 @@
 
       const userSocketA = new WebSocket("wss://" + window.location.hostname + "/user");
       const userSocketB = new WebSocket("wss://" + window.location.hostname + "/forward");
-      const whisperSocket = new WebSocket("wss://api.openai.com/v1/realtime?intent=transcription");
 
       let peerConnection;
       let remoteDescriptionSet = false;
@@ -583,7 +582,6 @@
           const audioEl = document.getElementById("remoteAudio");
           const audioToggle = document.getElementById("audioToggle");
           let audioEnabled = false;
-          let audioHasBeenOnBefore = false;
           audioToggle.onclick = async () => {
             if (!audioEl.srcObject) {
               console.warn("No audio stream yet.");
@@ -598,34 +596,8 @@
               try {
                 await audioEl.play();
                 audioEl.muted = false;
-                
                 audioToggle.textContent = "🔈 Unmuted";
                 console.log("🔈 Audio resumed/unmuted by user.");
-                if (!audioHasBeenOnBefore){
-                  const audioCtx = new AudioContext({ sampleRate: 16000 });
-                  await ctx.audioWorklet.addModule('pcm-processor.js');
-                  
-                  const source = audioCtx.createMediaStreamSource(audioEl.srcObject);
-                  const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
-
-                  workletNode.port.onmessage = (event) => {
-                  const pcm16 = new Int16Array(event.data); // one chunk of PCM16 samples
-                    base64Converted = btoa(pcm16)
-                    
-                  // TODO: Base64 encode pcm16.buffer and send over your transcription WebSocket
-                };
-                  
-                  source.connect(workletNode);
-
-                  
-                  //nothing yet, yet to add stuff
-                  
-                  
-                
-                }
-
-                audioHasBeenOnBefore = true
-
               } catch (e) {
                 console.error("Audio resume failed:", e);
               }
