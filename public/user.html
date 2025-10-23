@@ -526,22 +526,22 @@
       
       function voiceCommandParse(text) { 
         if (voiceCommandMode) { 
-          console.log("in voiceCommandParse()");
-          console.log(text);
+          // console.log("in voiceCommandParse()");
+          // console.log(text);
 
           if (text.includes("lyra") || text.includes("liar")|| text.includes("lie r") || text.includes("laira")|| text.includes("hi rest")|| text.includes("virus") || text.includes("byron") || text.includes("why run")|| text.includes("why around")|| text.includes("hi rez")|| text.includes("why i")|| text.includes("wheras")|| text.includes("iris")|| text.includes("why rob")|| text.includes("hi there")|| text.includes("higher")|| text.includes("i love")){
             console.log("lyra detected");
             if(text.includes("sit") || text.includes("s it")|| text.includes("say")|| text.includes("said")|| text.includes("six")){
               runCustomAnimations("sit");
-              console.log("sitting!")
+              // console.log("sitting!")
             }
             else if(text.includes("shake") || text.includes("shape")||text.includes("shave")){
               runCustomAnimations("shake");
-              console.log("shaking!")
+              // console.log("shaking!")
             }
             else if(text.includes("down") || text.includes("sleep")){
               runCustomAnimations("lie down");
-              console.log("lying down!")
+              // console.log("lying down!")
             }
             else if(text.includes("stay") || text.includes("rest day") || (text.includes("stop") && text.includes("follow")) || (text.includes("no") && text.includes("follow"))){
               if (aiFollowMode){
@@ -615,7 +615,7 @@
             const msg = parsed.message ?? "";
             if (typeof msg === "string" && msg.startsWith("[STT]")) {
               const phrase = msg.replace(/^\[STT\]\s*/,"").trim().toLowerCase();
-              console.log(phrase);
+              // console.log(phrase);
               voiceCommandParse(phrase);
             }
             
