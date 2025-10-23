@@ -526,10 +526,11 @@
       
       function voiceCommandParse(text) { 
         if (voiceCommandMode) { 
+          console.log("in voiceCommandParse()");
           console.log(text);
 
-          if (text.includes("lyra") || text.includes("liar")|| text.includes("lie r") || text.includes("laira")){
-
+          if (text.includes("lyra") || text.includes("liar")|| text.includes("lie r") || text.includes("laira")|| text.includes("hi rest")){
+            console.log("lyra detected");
             if(text.includes("sit")){
               runCustomAnimations("sit");
               console.log("sitting!")
