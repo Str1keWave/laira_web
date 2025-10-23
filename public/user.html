@@ -355,7 +355,7 @@
       let currentAIAction = "searching";
 
       const userSocketA = new WebSocket("wss://" + window.location.hostname + "/user");
-      const userSocketB = new WebSocket("wss://" + window.location.hostname + "/forward");
+      // const userSocketB = new WebSocket("wss://" + window.location.hostname + "/forward");
 
       let peerConnection;
       let remoteDescriptionSet = false;
@@ -554,10 +554,17 @@
               }
             }
             else if(text.includes("stand") || text.includes("up")){
+              if (stopSend){
+              stopSend=false;
+              rafId = requestAnimationFrame(animationLoop);}
+              
               userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ keystates:{w:false,a:false,s:false,d:false,q:false,e:false} }) }));
             }
             else if(text.includes("good girl")){
-
+              if (stopSend){
+              stopSend=false;
+              rafId = requestAnimationFrame(animationLoop);
+              }
               userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[90,200,135],[90,200,135]] }) })); setTimeout(() => { userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ keystates:{w:false,a:false,s:false,d:false,q:false,e:false} }) })); }, 500); 
               
             }
@@ -579,7 +586,7 @@
       }
 
       userSocketA.addEventListener("open", () => { console.log("Socket A connected"); });
-      userSocketB.addEventListener("open", () => console.log("Socket B connected"));
+      // userSocketB.addEventListener("open", () => console.log("Socket B connected"));
       let handshakeTimer = null;
       userSocketA.addEventListener("message", async (event) => {
         try {
@@ -612,7 +619,8 @@
               voiceCommandParse(phrase);
             }
             
-            // userSocketB.send(JSON.stringify(parsed)); }
+            // userSocketB.send(JSON.stringify(parsed)); 
+          }
         } catch (err) { console.error("Error handling message", err); }
       });
 
