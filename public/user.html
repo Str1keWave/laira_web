@@ -529,9 +529,9 @@
           console.log("in voiceCommandParse()");
           console.log(text);
 
-          if (text.includes("lyra") || text.includes("liar")|| text.includes("lie r") || text.includes("laira")|| text.includes("hi rest")){
+          if (text.includes("lyra") || text.includes("liar")|| text.includes("lie r") || text.includes("laira")|| text.includes("hi rest")|| text.includes("virus") || text.includes("byron") || text.includes("why run")|| text.includes("why around")|| text.includes("hi rez")){
             console.log("lyra detected");
-            if(text.includes("sit")){
+            if(text.includes("sit") || text.includes("s it")|| text.includes("say")|| text.includes("said")){
               runCustomAnimations("sit");
               console.log("sitting!")
             }
@@ -539,11 +539,11 @@
               runCustomAnimations("shake");
               console.log("shaking!")
             }
-            else if(text.includes("down") || text.includes("rest") || text.includes("sleep")){
+            else if(text.includes("down") || text.includes("sleep")){
               runCustomAnimations("lie down");
               console.log("lying down!")
             }
-            else if(text.includes("stay") || (text.includes("stop") && text.includes("follow")) || (text.includes("no") && text.includes("follow"))){
+            else if(text.includes("stay") || text.includes("rest day") || (text.includes("stop") && text.includes("follow")) || (text.includes("no") && text.includes("follow"))){
               if (aiFollowMode){
               toggleAIFollowMode();
               }
