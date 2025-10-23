@@ -344,6 +344,9 @@
       let aiFollowMode = false;
       let p5Instance = null;
       let objectDetector = null;
+
+      //Voice command mode toggle
+      let voiceCommandMode = true; //toggle this false once we have actual button logic to turn it on and off, right now on by default for testing
       
       // AI Follow control parameters
       const horizontalDeadzone = 100;
@@ -519,6 +522,49 @@
         };
         p5Instance = new p5(sketch);
       }
+
+      
+      function voiceCommandParse(text) { 
+        if (voiceCommandMode) { 
+          console.log(text);
+
+          if (text.includes("lyra") || text.includes("liar")|| text.includes("lie r") || text.includes("laira")){
+
+            if(text.includes("sit")){
+              runCustomAnimations("sit");
+              console.log("sitting!")
+            }
+            else if(text.includes("shake")){
+              runCustomAnimations("shake");
+              console.log("shaking!")
+            }
+            else if(text.includes("down") || text.includes("rest") || text.includes("sleep")){
+              runCustomAnimations("lie down");
+              console.log("lying down!")
+            }
+            else if(text.includes("stay") || (text.includes("stop") && text.includes("follow")) || (text.includes("no") && text.includes("follow"))){
+              if (aiFollowMode){
+              toggleAIFollowMode();
+              }
+            }
+            else if(text.includes("follow") ){
+              if (!aiFollowMode){
+              toggleAIFollowMode();
+              }
+            }
+            else if(text.includes("stand") || text.includes("up")){
+              userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ keystates:{w:false,a:false,s:false,d:false,q:false,e:false} }) }));
+            }
+            else if(text.includes("good girl")){
+
+              userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ angle:[[90,200,135],[90,200,135],[90,200,135],[90,200,135]] }) })); setTimeout(() => { userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ keystates:{w:false,a:false,s:false,d:false,q:false,e:false} }) })); }, 500); 
+              
+            }
+            
+          }
+        } 
+      
+      }
       function stopP5PersonDetection() { if (p5Instance) { p5Instance.remove(); p5Instance = null; } objectDetector = null; }
 //[back right leg],[front leg],[back left leg],[front leg]
       function runCustomAnimations(cmd){
@@ -560,8 +606,9 @@
             
             const msg = parsed.message ?? "";
             if (typeof msg === "string" && msg.startsWith("[STT]")) {
-              const phrase = msg.replace(/^\[STT\]\s*/,"");
+              const phrase = msg.replace(/^\[STT\]\s*/,"").trim().toLowerCase();
               console.log(phrase);
+              voiceCommandParse(phrase);
             }
             
             userSocketB.send(JSON.stringify(parsed)); }
