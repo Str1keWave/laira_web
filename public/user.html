@@ -684,7 +684,7 @@
       // heartbeat loop
 setInterval(() => {
   if (userSocketA.readyState === WebSocket.OPEN) {
-    userSocketA.send(JSON.stringify({ type:"chat-message", message: JSON.stringify({ alive: "healthy" }) }));
+    userSocketA.send(JSON.stringify({ type:"alive", message: JSON.stringify({ alive: "healthy" }) }));
   }
 }, 5000); // every 5 seconds
 
