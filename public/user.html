@@ -626,7 +626,7 @@
 
       async function startPeerConnection() {
         try {
-          const resp = await fetch("https://laira.metered.live/api/v1/turn/credentials?apiKey=cc105e937e35e7e785bafba97c04621dea2a");
+          const resp = await fetch("/turn-credentials");
           const iceServers = await resp.json();
           peerConnection = new RTCPeerConnection({ iceServers, iceTransportPolicy: "relay" });
           peerConnection.addTransceiver("video", { direction: "recvonly" });
