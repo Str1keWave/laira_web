@@ -20,6 +20,13 @@ app.get('/cli', (req, res) => {
   res.sendFile(__dirname + '/public/cli_page.html');
 });
 
+app.get("/turn-credentials", async (req, res) => {
+  const resp = await fetch(
+    `https://laira.metered.live/api/v1/turn/credentials?apiKey=${process.env.METERED_API_KEY}`
+  );
+  res.json(await resp.json());
+});
+
 // Create HTTP server and WebSocket server
 const server = app.listen(process.env.PORT || 3000, () => {
   console.log(`Server running on port ${server.address().port}`);
