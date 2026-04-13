@@ -17,7 +17,7 @@
     "revai-node-sdk": "^3.8.5"
   },
   "engines": {
-    "node": "14.x"
+    "node": "20.x"
   },
   "repository": {
     "url": "https://glitch.com/edit/#!/glitch-hello-node"
