@@ -32,7 +32,7 @@
 
         // Fetch TURN credentials dynamically
         const response = await fetch(
-          "https://laira.metered.live/api/v1/turn/credentials?apiKey=cc105e937e35e7e785bafba97c04621dea2a"
+          "/turn-credentials"
         );
         const iceServers = await response.json();
 
