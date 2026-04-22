@@ -575,9 +575,20 @@
       const d = state.lastDebug;
       if (!d) { $stats.textContent = ''; return; }
       const fmt = (b) => b ? `[${b[0]},${b[1]} ${b[2]}×${b[3]}]` : '—';
+      // kf_score is null during SAMURAI's Kalman warmup. Show the warmup
+      // progress instead so the user knows whether the motion model has
+      // engaged or whether they're still in plain-SAM2-with-memory mode.
+      let kfDisplay;
+      if (d.kf_score != null) {
+        kfDisplay = d.kf_score;
+      } else if (d.stable_frames != null && d.stable_threshold != null) {
+        kfDisplay = `warm ${d.stable_frames}/${d.stable_threshold}`;
+      } else {
+        kfDisplay = '—';
+      }
       $stats.textContent = [
         `score=${d.score ?? '—'}`,
-        `kf=${d.kf_score ?? '—'}`,
+        `kf=${kfDisplay}`,
         `cov=${d.coverage != null ? (d.coverage * 100).toFixed(1) + '%' : '—'}`,
         `n_comp=${d.n_components ?? '—'}`,
         `ms=${d.ms ?? '—'}`,

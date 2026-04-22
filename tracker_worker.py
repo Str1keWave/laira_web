@@ -180,7 +180,12 @@ def _mask_to_bbox(mask_2d):
 
 
 @app.cls(
-    gpu="T4",
+    # L4 is ~2-3x faster than T4 on transformer inference for ~35% more cost.
+    # T4 was the bottleneck pinning streaming to ~3 fps, which prevented
+    # SAMURAI's Kalman filter from ever completing its 15-stable-frame
+    # warmup. L4 should bring us into the 8-12 fps range where the motion
+    # model actually engages.
+    gpu="L4",
     image=image,
     scaledown_window=300,   # keep warm 5 min after last request
     max_containers=1,       # single shared container for the demo
@@ -205,8 +210,8 @@ class TrackerService:
             cv2.imwrite(os.path.join(tdir, "00000.jpg"),
                         cv2.cvtColor(dummy, cv2.COLOR_RGB2BGR))
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-                state = self.predictor.init_state(tdir, offload_video_to_cpu=True,
-                                                  offload_state_to_cpu=True)
+                state = self.predictor.init_state(tdir, offload_video_to_cpu=False,
+                                                  offload_state_to_cpu=False)
                 self.predictor.add_new_points_or_box(
                     state, frame_idx=0, obj_id=0,
                     box=np.array([100, 100, 300, 300], dtype=np.float32),
@@ -244,8 +249,13 @@ class TrackerService:
             jpg_path = os.path.join(tdir, "00000.jpg")
             cv2.imwrite(jpg_path, cv2.cvtColor(first_rgb, cv2.COLOR_RGB2BGR))
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                # Offloads OFF: we prune state["images"] aggressively
+                # (IMAGES_KEEP_RECENT) so VRAM stays tiny, and shipping the
+                # memory bank back-and-forth between CPU/GPU each frame was
+                # the primary cause of the ~3 fps streaming ceiling. Keeping
+                # everything on GPU should bring us closer to ~10-15 fps.
                 state = self.predictor.init_state(
-                    tdir, offload_video_to_cpu=True, offload_state_to_cpu=True
+                    tdir, offload_video_to_cpu=False, offload_state_to_cpu=False
                 )
                 _, _, masks = self.predictor.add_new_points_or_box(
                     state,
@@ -392,6 +402,16 @@ class TrackerService:
 
         debug["frame_idx"] = frame_idx
         debug["raw_mode"] = raw_mode
+        # Expose SAMURAI's Kalman warmup state. kf_score stays None until
+        # stable_frames hits stable_frames_threshold (default 15) and only
+        # increments on consecutive frames where iou > stable_ious_threshold.
+        # If you see this stuck at low values, SAMURAI never finished warmup
+        # and is operating as plain SAM 2 with no motion prior.
+        try:
+            debug["stable_frames"] = int(self.predictor.stable_frames)
+            debug["stable_threshold"] = int(self.predictor.stable_frames_threshold)
+        except Exception:
+            pass
         return bbox, debug
 
     def _close_session(self, sid):
