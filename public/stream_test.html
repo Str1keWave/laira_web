@@ -223,7 +223,8 @@
           setComponent('config', 'err', 'MODAL_TRACKER_URL not set on server');
           return;
         }
-        state.modalUrl = cfg.modalTrackerUrl;
+        // Strip any trailing slash so `${url}/healthz` doesn't become `//healthz`.
+        state.modalUrl = cfg.modalTrackerUrl.replace(/\/+$/, '');
         setComponent('config', 'ok', 'loaded');
       } catch (err) {
         setComponent('config', 'err', err.message);
