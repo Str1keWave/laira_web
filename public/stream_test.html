@@ -79,6 +79,19 @@
       font-size: 11px; line-height: 1.5;
     }
     .sw { display: inline-block; width: 10px; height: 10px; vertical-align: middle; margin-right: 4px; }
+    #controls {
+      display: flex; gap: 16px; align-items: center;
+      margin: 6px 0 0;
+      font-size: 12px; color: #bbb;
+    }
+    #controls label { cursor: pointer; user-select: none; }
+    #controls input { vertical-align: middle; margin-right: 4px; }
+    #stats {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; color: #888;
+      margin: 4px 0 0; min-height: 14px;
+      max-width: 90vw; text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -102,9 +115,16 @@
     <canvas id="overlay"></canvas>
     <div id="legend">
       <div><span class="sw" style="background:#ff3b30"></span>local tracker (every frame)</div>
-      <div><span class="sw" style="background:#0af"></span>SAM 2 snap (~1 Hz)</div>
+      <div><span class="sw" style="background:#0af"></span>SAM 2 snap</div>
+      <div><span class="sw" style="background:#f1c40f"></span>SAM prompt seed (diag)</div>
     </div>
   </div>
+
+  <div id="controls">
+    <label><input type="checkbox" id="toggle-sam-off" />disable SAM snap</label>
+    <label><input type="checkbox" id="toggle-sam-only" />SAM-only continuous (raw, no clamp)</label>
+  </div>
+  <div id="stats"></div>
 
   <div id="prompt-row">
     <input id="prompt" placeholder='waiting on dependencies…'
@@ -117,11 +137,14 @@
 
   <script>
   (() => {
-    const $status  = document.getElementById('status');
-    const $video   = document.getElementById('video');
-    const $overlay = document.getElementById('overlay');
-    const $prompt  = document.getElementById('prompt');
-    const $send    = document.getElementById('send');
+    const $status   = document.getElementById('status');
+    const $video    = document.getElementById('video');
+    const $overlay  = document.getElementById('overlay');
+    const $prompt   = document.getElementById('prompt');
+    const $send     = document.getElementById('send');
+    const $stats    = document.getElementById('stats');
+    const $tSamOff  = document.getElementById('toggle-sam-off');
+    const $tSamOnly = document.getElementById('toggle-sam-only');
     const ctx = $overlay.getContext('2d');
 
     // Component readiness — gates the prompt UI.
@@ -142,9 +165,14 @@
       lastSnap:       0,
       snapEveryMs:    1000,
       sentInFlight:   false,           // throttle so we don't queue Modal calls
-      lastSamBbox:    null,            // for cyan flash overlay
+      lastSamBbox:    null,            // most recent SAM bbox (persistent in diag)
       lastSamAt:      0,
+      lastSeedBbox:   null,            // seed sent to SAM (yellow overlay)
+      lastDebug:      null,            // debug payload from server
       reconnectTried: false,           // one-shot WS reconnect on drop
+      // Diagnostic toggles ↓
+      samOff:         false,           // skip all SAM track calls
+      samOnly:        false,           // hide local box, stream raw SAM
     };
 
     function setStatus(msg) {
@@ -363,32 +391,59 @@
     }
 
     function sendSamTrack() {
+      if (state.samOff) return;
       if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
       if (state.sentInFlight) return;
       const frameJpegB64 = grabFrameJpegB64(0.7);
       state.sentInFlight = true;
-      // Include the browser's current local-tracker bbox as the prompt seed.
-      // Because matchTemplate keeps a fixed-size template, this bbox doesn't
-      // grow frame-to-frame, which breaks any mask-expansion feedback loop.
-      state.ws.send(JSON.stringify({
+      // In samOnly mode we want to see SAM's natural behavior:
+      //   - omit the browser bbox so SAM uses its own previous output as seed
+      //   - request raw mode so the server skips the output growth clamp
+      const msg = {
         type: 'track', session_id: state.sessionId, frame: frameJpegB64,
-        bbox: state.lastBbox || undefined,
+      };
+      if (state.samOnly) {
+        msg.raw = true;
+        // bbox omitted → server uses its own last_bbox
+      } else {
+        msg.bbox = state.lastBbox || undefined;
+      }
+      state.ws.send(JSON.stringify(msg));
+    }
+
+    function sendStreamFlag(enabled) {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      state.ws.send(JSON.stringify({
+        type: 'stream', session_id: state.sessionId, enabled: !!enabled,
       }));
     }
 
     function onSamMessage(msg) {
       if (msg.type === 'init_ok') {
         setStatus('SAM 2 session ready. tracking…');
+        if (msg.debug) { state.lastDebug = msg.debug; renderStats(); }
       } else if (msg.type === 'init_fail') {
         setStatus('SAM 2 init failed (' + (msg.error || '') + ') — try a different prompt');
         state.tracking = false;
         maybeEnableUI();
+      } else if (msg.type === 'stream_ack') {
+        console.log('[stream] server ack', msg.enabled);
       } else if (msg.type === 'bbox') {
         state.sentInFlight = false;
+        if (msg.debug) {
+          state.lastDebug = msg.debug;
+          if (msg.debug.seed_bbox) state.lastSeedBbox = msg.debug.seed_bbox;
+          renderStats();
+        }
         if (msg.bbox) {
           state.lastSamBbox = msg.bbox;
           state.lastSamAt = performance.now();
-          seedLocalTracker(msg.bbox);
+          // In samOnly diagnostic mode we deliberately don't snap the local
+          // tracker — we want to see SAM drift on its own without any
+          // browser-side correction muddying the picture.
+          if (!state.samOnly) {
+            seedLocalTracker(msg.bbox);
+          }
         }
       } else if (msg.type === 'error') {
         state.sentInFlight = false;
@@ -483,31 +538,94 @@
 
     function drawOverlay() {
       ctx.clearRect(0, 0, $overlay.width, $overlay.height);
-      if (state.lastBbox) {
+      // Local tracker box (red) — hidden in SAM-only diagnostic mode.
+      if (state.lastBbox && !state.samOnly) {
         const [x, y, w, h] = state.lastBbox;
         ctx.strokeStyle = '#ff3b30';
         ctx.lineWidth = 2;
         ctx.strokeRect(x, y, w, h);
       }
-      if (state.lastSamBbox && performance.now() - state.lastSamAt < 250) {
-        const [x, y, w, h] = state.lastSamBbox;
-        ctx.strokeStyle = '#00aaff';
-        ctx.lineWidth = 3;
-        ctx.strokeRect(x, y, w, h);
+      // SAM box (cyan). In SAM-only mode, draw persistently and thicker.
+      // Otherwise it's a 250ms flash.
+      if (state.lastSamBbox) {
+        const persistent = state.samOnly;
+        const flashing = !persistent &&
+          performance.now() - state.lastSamAt < 250;
+        if (persistent || flashing) {
+          const [x, y, w, h] = state.lastSamBbox;
+          ctx.strokeStyle = '#00aaff';
+          ctx.lineWidth = persistent ? 2 : 3;
+          ctx.strokeRect(x, y, w, h);
+        }
       }
+      // Prompt-seed box (yellow, dashed) — only in SAM-only diagnostic mode.
+      // Lets you see at a glance whether SAM is consistently expanding
+      // beyond what it was asked to look at.
+      if (state.samOnly && state.lastSeedBbox) {
+        const [x, y, w, h] = state.lastSeedBbox;
+        ctx.strokeStyle = '#f1c40f';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([6, 4]);
+        ctx.strokeRect(x, y, w, h);
+        ctx.setLineDash([]);
+      }
+    }
+
+    function renderStats() {
+      const d = state.lastDebug;
+      if (!d) { $stats.textContent = ''; return; }
+      const fmt = (b) => b ? `[${b[0]},${b[1]} ${b[2]}×${b[3]}]` : '—';
+      $stats.textContent = [
+        `score=${d.score ?? '—'}`,
+        `cov=${d.coverage != null ? (d.coverage * 100).toFixed(1) + '%' : '—'}`,
+        `n_comp=${d.n_components ?? '—'}`,
+        `seed=${fmt(d.seed_bbox)}`,
+        `raw=${fmt(d.raw_bbox)}`,
+        `largest=${fmt(d.largest_blob_bbox)}`,
+      ].join('  ');
     }
 
     // ---------- 9) main loop ----------
     function trackLoop(t) {
       if (!state.tracking) return;
-      trackLocal();
+      // Skip the local tracker entirely in SAM-only mode — we want pure SAM
+      // for diagnosis, no template-matching influence on what's overlaid.
+      if (!state.samOnly) trackLocal();
       drawOverlay();
-      if (t - state.lastSnap > state.snapEveryMs) {
+      // In samOnly mode: send as fast as the previous response returns
+      // (sentInFlight throttle inside sendSamTrack handles back-pressure).
+      const interval = state.samOnly ? 0 : state.snapEveryMs;
+      if (t - state.lastSnap > interval) {
         state.lastSnap = t;
         sendSamTrack();
       }
       requestAnimationFrame(trackLoop);
     }
+
+    // ---------- 10) diagnostic toggles ----------
+    $tSamOff.addEventListener('change', () => {
+      state.samOff = $tSamOff.checked;
+      if (state.samOff && state.samOnly) {
+        // Mutually exclusive — turning SAM off forces SAM-only off.
+        $tSamOnly.checked = false;
+        state.samOnly = false;
+        sendStreamFlag(false);
+      }
+      console.log('[toggle] samOff =', state.samOff);
+    });
+    $tSamOnly.addEventListener('change', () => {
+      state.samOnly = $tSamOnly.checked;
+      if (state.samOnly && state.samOff) {
+        $tSamOff.checked = false;
+        state.samOff = false;
+      }
+      sendStreamFlag(state.samOnly);
+      console.log('[toggle] samOnly =', state.samOnly);
+    });
+    // Make sure we tell the server to stop streaming if the page goes away.
+    window.addEventListener('beforeunload', () => {
+      if (state.samOnly) sendStreamFlag(false);
+    });
 
     // ---------- bootstrap ----------
     // Camera + opencv.js + config can all start in parallel.

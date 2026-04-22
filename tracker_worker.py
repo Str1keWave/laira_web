@@ -14,11 +14,16 @@ that maintains a per-session memory bank across frames.
 
 Protocol (JSON over websocket /ws):
   c->s: {"type":"init",  "session_id":str, "frame":b64jpg, "bbox":[x1,y1,x2,y2]}
-  s->c: {"type":"init_ok",   "session_id":str, "bbox":[x,y,w,h]}
-  s->c: {"type":"init_fail", "session_id":str, "error":str}
+  s->c: {"type":"init_ok",   "session_id":str, "bbox":[x,y,w,h], "debug":{...}}
+  s->c: {"type":"init_fail", "session_id":str, "error":str, "debug":{...}}
   c->s: {"type":"track", "session_id":str, "frame":b64jpg,
-         "bbox":[x,y,w,h] | omitted}   # if provided, used as prompt seed
-  s->c: {"type":"bbox",  "session_id":str, "bbox":[x,y,w,h]|null, "ms":int}
+         "bbox":[x,y,w,h] | omitted,    # if provided, used as prompt seed
+         "raw": true | omitted}         # diagnostic: skip output growth clamp
+  s->c: {"type":"bbox",  "session_id":str, "bbox":[x,y,w,h]|null,
+         "ms":int, "debug":{score,coverage,n_components,raw_bbox,
+                            largest_blob_bbox,seed_bbox,prompt_xyxy,raw_mode}}
+  c->s: {"type":"stream", "session_id":str, "enabled":bool}
+  s->c: {"type":"stream_ack", "session_id":str, "enabled":bool}
   c->s: {"type":"close", "session_id":str}
 
 Deploy:    modal deploy tracker_worker.py
@@ -105,11 +110,11 @@ class TrackerService:
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     def _segment(self, rgb, box_xyxy):
-        """Run SAM 2 image predictor with a box prompt; return (x,y,w,h) or None.
+        """Run SAM 2 image predictor with a box prompt.
 
-        Rejects masks that cover >70% of the frame — those are almost always
-        SAM picking up the background rather than the object, and snapping
-        the local tracker to a whole-frame bbox kills tracking.
+        Returns (bbox_xywh, debug_dict) or (None, debug_dict).
+        debug_dict carries diagnostic info for the client overlay:
+          score, coverage, n_components, raw_bbox, largest_blob_bbox.
         """
         H, W = rgb.shape[:2]
         img_area = H * W
@@ -119,21 +124,66 @@ class TrackerService:
                 box=np.array(box_xyxy, dtype=np.float32),
                 multimask_output=False,
             )
-        m = masks[0] > 0
+        m = (masks[0] > 0).astype(np.uint8)
         mask_area = int(m.sum())
         coverage = mask_area / img_area if img_area else 0.0
         score = float(scores[0]) if len(scores) else 0.0
-        print(f"[segment] box={tuple(int(v) for v in box_xyxy)} "
-              f"score={score:.3f} coverage={coverage:.2%}")
+
+        debug = {
+            "score": round(score, 3),
+            "coverage": round(coverage, 4),
+            "n_components": 0,
+            "raw_bbox": None,
+            "largest_blob_bbox": None,
+        }
+
         if mask_area == 0:
-            return None
+            print(f"[segment] empty mask box={tuple(int(v) for v in box_xyxy)}")
+            return None, debug
         if coverage > 0.70:
             print(f"[segment] REJECT mask: coverage {coverage:.2%} > 70%")
-            return None
+            return None, debug
+
+        # Raw bbox = min/max of all mask pixels (current behavior).
         nz = np.argwhere(m)
         y1, x1 = nz.min(axis=0)
         y2, x2 = nz.max(axis=0)
-        return int(x1), int(y1), int(x2 - x1), int(y2 - y1)
+        raw_bbox = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+        debug["raw_bbox"] = raw_bbox
+
+        # Connected-component analysis: largest blob's bbox can be much
+        # smaller than raw_bbox if there are stray pixels. This is the
+        # diagnostic that'll tell us whether stray pixels are the culprit.
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+        # label 0 is background; skip it
+        if n_labels > 1:
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            biggest = int(np.argmax(areas)) + 1
+            bx = int(stats[biggest, cv2.CC_STAT_LEFT])
+            by = int(stats[biggest, cv2.CC_STAT_TOP])
+            bw = int(stats[biggest, cv2.CC_STAT_WIDTH])
+            bh = int(stats[biggest, cv2.CC_STAT_HEIGHT])
+            largest_blob_bbox = (bx, by, bw, bh)
+        else:
+            largest_blob_bbox = raw_bbox
+        debug["n_components"] = max(0, n_labels - 1)
+        debug["largest_blob_bbox"] = largest_blob_bbox
+
+        # Loud log if raw bbox is much bigger than largest-blob bbox →
+        # stray-pixel inflation is happening.
+        rw, rh = raw_bbox[2], raw_bbox[3]
+        lw, lh = largest_blob_bbox[2], largest_blob_bbox[3]
+        if rw > lw * 1.3 or rh > lh * 1.3:
+            print(f"[segment] STRAY-PIXEL inflation: "
+                  f"raw={raw_bbox} largest_blob={largest_blob_bbox} "
+                  f"n_comp={debug['n_components']}")
+
+        print(f"[segment] box={tuple(int(v) for v in box_xyxy)} "
+              f"score={score:.3f} coverage={coverage:.2%} "
+              f"n_comp={debug['n_components']} "
+              f"raw={raw_bbox} largest={largest_blob_bbox}")
+
+        return raw_bbox, debug
 
     @modal.asgi_app()
     def fastapi_app(self):
@@ -170,19 +220,35 @@ class TrackerService:
                             ))
                             continue
                         x1, y1, x2, y2 = data["bbox"]
-                        bbox = self._segment(rgb, (x1, y1, x2, y2))
+                        bbox, debug = self._segment(rgb, (x1, y1, x2, y2))
                         if bbox is None:
                             await websocket.send_text(json.dumps(
-                                {"type": "init_fail", "session_id": sid, "error": "no mask"}
+                                {"type": "init_fail", "session_id": sid,
+                                 "error": "no mask", "debug": debug}
                             ))
                             continue
                         self.sessions[sid] = {
                             "last_bbox": bbox,
                             "h": rgb.shape[0],
                             "w": rgb.shape[1],
+                            "stream": False,
                         }
                         await websocket.send_text(json.dumps(
-                            {"type": "init_ok", "session_id": sid, "bbox": list(bbox)}
+                            {"type": "init_ok", "session_id": sid,
+                             "bbox": list(bbox), "debug": debug}
+                        ))
+
+                    elif typ == "stream":
+                        # Diagnostic: client toggles continuous SAM mode.
+                        # Server-side this is mostly a flag for logging; the
+                        # browser still drives frame cadence via track msgs.
+                        if sid in self.sessions:
+                            self.sessions[sid]["stream"] = bool(data.get("enabled"))
+                            print(f"[stream] sid={sid} -> "
+                                  f"{self.sessions[sid]['stream']}")
+                        await websocket.send_text(json.dumps(
+                            {"type": "stream_ack", "session_id": sid,
+                             "enabled": bool(data.get("enabled"))}
                         ))
 
                     elif typ == "track":
@@ -204,9 +270,11 @@ class TrackerService:
                         # the server's last SAM bbox if the browser didn't send one.
                         seed_bbox = data.get("bbox") or sess["last_bbox"]
                         x, y, w, h = seed_bbox
+                        # raw=true → diagnostic mode: skip output clamp so the
+                        # client can see SAM's natural behavior.
+                        raw_mode = bool(data.get("raw"))
                         # Cap expansion at a small absolute pixel value so a large
-                        # bbox doesn't expand into a whole-frame prompt (which makes
-                        # SAM 2 segment the entire foreground).
+                        # bbox doesn't expand into a whole-frame prompt.
                         mx = min(int(w * 0.15), 24)
                         my = min(int(h * 0.15), 24)
                         prompt = (
@@ -216,11 +284,9 @@ class TrackerService:
                             min(H, y + h + my),
                         )
                         t0 = time.time()
-                        bbox = self._segment(rgb, prompt)
-                        # Clamp output growth: never let SAM return a bbox more
-                        # than 1.3x the seed in either dimension. Tightening
-                        # (shrinking) is fine; runaway expansion is the bug.
-                        if bbox is not None:
+                        bbox, debug = self._segment(rgb, prompt)
+                        # Output growth clamp (skipped in raw mode for diagnosis).
+                        if bbox is not None and not raw_mode:
                             bx, by, bw, bh = bbox
                             max_w = int(w * 1.3)
                             max_h = int(h * 1.3)
@@ -228,7 +294,6 @@ class TrackerService:
                                 print(f"[track] CLAMP growth: "
                                       f"({bw}x{bh}) -> cap ({max_w}x{max_h}) "
                                       f"from seed ({w}x{h})")
-                                # Keep center, cap dims
                                 cx, cy = bx + bw // 2, by + bh // 2
                                 bw = min(bw, max_w)
                                 bh = min(bh, max_h)
@@ -238,9 +303,14 @@ class TrackerService:
                         dt_ms = int((time.time() - t0) * 1000)
                         if bbox is not None:
                             sess["last_bbox"] = bbox
+                        # Echo the prompt & seed so the client can overlay them.
+                        debug["seed_bbox"] = list(seed_bbox)
+                        debug["prompt_xyxy"] = list(prompt)
+                        debug["raw_mode"] = raw_mode
                         await websocket.send_text(json.dumps(
                             {"type": "bbox", "session_id": sid,
-                             "bbox": list(bbox) if bbox else None, "ms": dt_ms}
+                             "bbox": list(bbox) if bbox else None,
+                             "ms": dt_ms, "debug": debug}
                         ))
 
                     elif typ == "close":
