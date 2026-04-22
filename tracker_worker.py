@@ -1,30 +1,40 @@
 """
 LaiRA tracker service — Modal serverless GPU.
 
-MVP design: SAM 2 image predictor with a rolling box prompt.
-Each track call uses the previous bbox (expanded by 30%) as a box prompt
-to SAM 2's image predictor and returns the tightened mask's bbox.
+Architecture (current): SAMURAI on top of SAM 2.1 video predictor.
+Each session maintains a true memory bank — every track call appends the new
+frame to the inference state and runs one propagation step. SAMURAI's
+motion-aware (Kalman-filtered) memory selection picks the most useful prior
+frames as conditioning. This is the actual tracker, not per-frame stateless
+segmentation.
 
-This is NOT true SAMURAI memory-bank tracking — it's per-frame image
-segmentation conditioned on the previous bbox. Fast (~150ms on T4),
-stateless beyond "last bbox," and good enough to validate the pipeline.
+The SAMURAI video predictor was written for offline use: `init_state` requires
+a video folder and `propagate_in_video` iterates the whole thing. We adapt it
+for streaming by:
+  1. seeding init_state from a temp dir with the first frame,
+  2. preprocessing each new frame the same way the official loader does,
+  3. appending to inference_state["images"] and bumping num_frames,
+  4. calling propagate_in_video(start_frame_idx=N, max_frame_num_to_track=1)
+     and pulling the single yielded mask.
 
-Upgrade path: replace _segment with streaming SAM 2 video predictor
-that maintains a per-session memory bank across frames.
+This works because all the predictor really cares about is that
+inference_state["images"][frame_idx] exists and num_frames is correct;
+the memory bank does the rest.
 
 Protocol (JSON over websocket /ws):
   c->s: {"type":"init",  "session_id":str, "frame":b64jpg, "bbox":[x1,y1,x2,y2]}
   s->c: {"type":"init_ok",   "session_id":str, "bbox":[x,y,w,h], "debug":{...}}
   s->c: {"type":"init_fail", "session_id":str, "error":str, "debug":{...}}
   c->s: {"type":"track", "session_id":str, "frame":b64jpg,
-         "bbox":[x,y,w,h] | omitted,    # if provided, used as prompt seed
-         "raw": true | omitted}         # diagnostic: skip output growth clamp
+         "raw": true | omitted}      # diagnostic: skip output growth clamp
   s->c: {"type":"bbox",  "session_id":str, "bbox":[x,y,w,h]|null,
-         "ms":int, "debug":{score,coverage,n_components,raw_bbox,
-                            largest_blob_bbox,seed_bbox,prompt_xyxy,raw_mode}}
+         "ms":int, "debug":{...}}
   c->s: {"type":"stream", "session_id":str, "enabled":bool}
   s->c: {"type":"stream_ack", "session_id":str, "enabled":bool}
   c->s: {"type":"close", "session_id":str}
+
+Note: client may still send "bbox" in track messages — it's ignored now.
+SAMURAI tracks via memory bank, not via per-frame box prompts.
 
 Deploy:    modal deploy tracker_worker.py
 Healthz:   GET  https://<workspace>--laira-tracker-trackerservice-fastapi-app.modal.run/healthz
@@ -32,6 +42,8 @@ Websocket: WS   wss://<workspace>--laira-tracker-trackerservice-fastapi-app.moda
 """
 import base64
 import json
+import os
+import tempfile
 import time
 
 import modal
@@ -42,7 +54,14 @@ CHECKPOINT_URL = (
     "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt"
 )
 CHECKPOINT_PATH = "/root/checkpoints/sam2.1_hiera_base_plus.pt"
-CFG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+# SAMURAI ships its own configs that wire the Kalman-augmented memory selection.
+CFG = "configs/samurai/sam2.1_hiera_b+.yaml"
+
+# Frames per session before we start dropping the oldest from the in-memory
+# tensor. The model's memory bank only uses ~7 of these anyway; we just need
+# the frame_idx accounting to stay valid. With offload_video_to_cpu=True each
+# 1024x1024 frame is ~12MB on CPU RAM, so 600 ≈ 7GB cap.
+MAX_FRAMES_PER_SESSION = 600
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -57,23 +76,97 @@ image = (
         "hydra-core",
         "iopath",
         "tqdm",
+        "loguru",
+        "scipy",        # SAMURAI's Kalman filter imports scipy.linalg
     )
     .run_commands(
-        # Clone to a non-`sam2` directory name so SAM 2's own
-        # "are-you-running-from-the-repo-dir" check doesn't trip at import time.
-        "git clone https://github.com/facebookresearch/sam2.git /opt/sam2-src",
-        "cd /opt/sam2-src && pip install -e .",
+        # SAMURAI is a fork of SAM 2 with Kalman-filtered memory selection.
+        # The actual sam2 Python package lives at samurai/sam2/sam2/.
+        "git clone https://github.com/yangchris11/samurai.git /opt/samurai-src",
+        # Skip the CUDA extension build — it's only needed for an optional
+        # mask post-processing step and adds ~3 min to image build for nothing
+        # we care about right now.
+        "cd /opt/samurai-src/sam2 && SAM2_BUILD_CUDA=0 pip install -e .",
         f"mkdir -p /root/checkpoints && wget -q -O {CHECKPOINT_PATH} {CHECKPOINT_URL}",
     )
-    .workdir("/opt/sam2-src")
+    # Workdir is the parent of the sam2 package dir so Hydra finds configs and
+    # SAM 2's "are you running from inside the package" check doesn't trip.
+    .workdir("/opt/samurai-src/sam2")
 )
 
 with image.imports():
     import cv2
     import numpy as np
     import torch
-    from sam2.build_sam import build_sam2
-    from sam2.sam2_image_predictor import SAM2ImagePredictor
+    from PIL import Image
+    from sam2.build_sam import build_sam2_video_predictor
+
+
+# ---------- frame preprocessing ----------
+# SAM 2 normalizes frames with ImageNet mean/std after resize to image_size².
+# We replicate that here so a streaming frame matches what load_video_frames
+# would produce. Source: sam2/utils/misc.py::_load_img_as_tensor.
+_SAM2_MEAN = (0.485, 0.456, 0.406)
+_SAM2_STD = (0.229, 0.224, 0.225)
+
+
+def _frame_to_sam2_tensor(rgb_np, image_size):
+    """RGB ndarray (H, W, 3) uint8 → preprocessed tensor (3, image_size, image_size).
+
+    Output sits on CPU; predictor moves to GPU per-frame as needed.
+    """
+    pil = Image.fromarray(rgb_np)
+    pil = pil.resize((image_size, image_size))
+    arr = (np.array(pil) / 255.0).astype(np.float32)
+    img = torch.from_numpy(arr).permute(2, 0, 1)  # (3, H, W)
+    mean = torch.tensor(_SAM2_MEAN, dtype=torch.float32).view(3, 1, 1)
+    std = torch.tensor(_SAM2_STD, dtype=torch.float32).view(3, 1, 1)
+    return (img - mean) / std
+
+
+def _mask_to_bbox(mask_2d):
+    """Binary mask (H, W) → ((x, y, w, h), debug) using largest connected component.
+
+    Returns (None, debug) for empty masks.
+    """
+    m = mask_2d.astype(np.uint8)
+    H, W = m.shape
+    debug = {
+        "score": None,         # filled by caller (SAMURAI iou/kf scores)
+        "coverage": 0.0,
+        "n_components": 0,
+        "raw_bbox": None,
+        "largest_blob_bbox": None,
+    }
+    area = int(m.sum())
+    if area == 0:
+        return None, debug
+    debug["coverage"] = round(area / (H * W), 4)
+
+    nz = np.argwhere(m)
+    y1, x1 = nz.min(axis=0)
+    y2, x2 = nz.max(axis=0)
+    raw_bbox = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+    debug["raw_bbox"] = raw_bbox
+
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    if n_labels > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        biggest = int(np.argmax(areas)) + 1
+        bx = int(stats[biggest, cv2.CC_STAT_LEFT])
+        by = int(stats[biggest, cv2.CC_STAT_TOP])
+        bw = int(stats[biggest, cv2.CC_STAT_WIDTH])
+        bh = int(stats[biggest, cv2.CC_STAT_HEIGHT])
+        largest_blob_bbox = (bx, by, bw, bh)
+    else:
+        largest_blob_bbox = raw_bbox
+    debug["n_components"] = max(0, n_labels - 1)
+    debug["largest_blob_bbox"] = largest_blob_bbox
+
+    # Use largest blob — stray-pixel inflation was the suspected failure mode
+    # under the old image-predictor regime. Even with SAMURAI's better masks,
+    # this is the safer choice for downstream use.
+    return largest_blob_bbox, debug
 
 
 @app.cls(
@@ -88,20 +181,29 @@ class TrackerService:
     @modal.enter()
     def setup(self):
         torch.set_float32_matmul_precision("high")
-        self.sam = build_sam2(CFG, CHECKPOINT_PATH, device="cuda")
-        self.predictor = SAM2ImagePredictor(self.sam)
+        self.predictor = build_sam2_video_predictor(CFG, CHECKPOINT_PATH, device="cuda")
+        # Per-session state: each entry is the SAMURAI inference_state dict
+        # produced by predictor.init_state(), plus our bookkeeping.
         self.sessions: dict = {}
-        # warm up so the first real call isn't a 3s outlier
-        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-        with torch.inference_mode():
-            self.predictor.set_image(dummy)
-            self.predictor.predict(
-                box=np.array([100, 100, 300, 300], dtype=np.float32),
-                multimask_output=False,
-            )
-        print("[TrackerService] ready")
 
-    def _decode(self, b64_jpg: str) -> "np.ndarray":
+        # Warmup: build a dummy state from a 1-frame temp dir and run a box
+        # prompt + 1-frame propagation. Front-loads the autograd graph build
+        # and CUDA kernel compilation so the first real init isn't a 3s outlier.
+        with tempfile.TemporaryDirectory() as tdir:
+            dummy = (np.random.rand(480, 640, 3) * 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(tdir, "00000.jpg"),
+                        cv2.cvtColor(dummy, cv2.COLOR_RGB2BGR))
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                state = self.predictor.init_state(tdir, offload_video_to_cpu=True,
+                                                  offload_state_to_cpu=True)
+                self.predictor.add_new_points_or_box(
+                    state, frame_idx=0, obj_id=0,
+                    box=np.array([100, 100, 300, 300], dtype=np.float32),
+                )
+        print("[TrackerService] SAMURAI ready")
+
+    # ---------- helpers ----------
+    def _decode(self, b64_jpg: str):
         raw = base64.b64decode(b64_jpg)
         arr = np.frombuffer(raw, dtype=np.uint8)
         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -109,81 +211,126 @@ class TrackerService:
             return None
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    def _segment(self, rgb, box_xyxy):
-        """Run SAM 2 image predictor with a box prompt.
+    def _new_session(self, sid, first_rgb, bbox_xyxy):
+        """Initialize a SAMURAI inference state from the first frame + box prompt.
 
-        Returns (bbox_xywh, debug_dict) or (None, debug_dict).
-        debug_dict carries diagnostic info for the client overlay:
-          score, coverage, n_components, raw_bbox, largest_blob_bbox.
+        Returns (bbox_xywh, debug) or (None, debug).
         """
-        H, W = rgb.shape[:2]
-        img_area = H * W
-        with torch.inference_mode():
-            self.predictor.set_image(rgb)
-            masks, scores, _ = self.predictor.predict(
-                box=np.array(box_xyxy, dtype=np.float32),
-                multimask_output=False,
-            )
-        m = (masks[0] > 0).astype(np.uint8)
-        mask_area = int(m.sum())
-        coverage = mask_area / img_area if img_area else 0.0
-        score = float(scores[0]) if len(scores) else 0.0
+        H, W = first_rgb.shape[:2]
+        with tempfile.TemporaryDirectory() as tdir:
+            # init_state needs a video folder; give it a 1-frame "video".
+            jpg_path = os.path.join(tdir, "00000.jpg")
+            cv2.imwrite(jpg_path, cv2.cvtColor(first_rgb, cv2.COLOR_RGB2BGR))
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                state = self.predictor.init_state(
+                    tdir, offload_video_to_cpu=True, offload_state_to_cpu=True
+                )
+                _, _, masks = self.predictor.add_new_points_or_box(
+                    state,
+                    frame_idx=0,
+                    obj_id=0,
+                    box=np.array(bbox_xyxy, dtype=np.float32),
+                )
 
-        debug = {
-            "score": round(score, 3),
-            "coverage": round(coverage, 4),
-            "n_components": 0,
-            "raw_bbox": None,
-            "largest_blob_bbox": None,
+        # masks is (B, 1, H_orig, W_orig) — float logits at video resolution.
+        mask = (masks[0, 0].cpu().numpy() > 0)
+        bbox, debug = _mask_to_bbox(mask)
+        debug["score"] = None  # add_new_points_or_box doesn't expose iou here
+        if bbox is None:
+            return None, debug
+
+        self.sessions[sid] = {
+            "state": state,
+            "next_frame_idx": 1,   # 0 was the init frame
+            "h": H, "w": W,
+            "last_bbox": bbox,
+            "stream": False,
         }
+        return bbox, debug
 
-        if mask_area == 0:
-            print(f"[segment] empty mask box={tuple(int(v) for v in box_xyxy)}")
-            return None, debug
-        if coverage > 0.70:
-            print(f"[segment] REJECT mask: coverage {coverage:.2%} > 70%")
-            return None, debug
+    def _track_frame(self, sid, rgb, raw_mode):
+        """Append a frame to the session and run one propagation step.
 
-        # Raw bbox = min/max of all mask pixels (current behavior).
-        nz = np.argwhere(m)
-        y1, x1 = nz.min(axis=0)
-        y2, x2 = nz.max(axis=0)
-        raw_bbox = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
-        debug["raw_bbox"] = raw_bbox
+        Returns (bbox_xywh|None, debug_dict).
+        """
+        sess = self.sessions[sid]
+        state = sess["state"]
+        frame_idx = sess["next_frame_idx"]
 
-        # Connected-component analysis: largest blob's bbox can be much
-        # smaller than raw_bbox if there are stray pixels. This is the
-        # diagnostic that'll tell us whether stray pixels are the culprit.
-        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
-        # label 0 is background; skip it
-        if n_labels > 1:
-            areas = stats[1:, cv2.CC_STAT_AREA]
-            biggest = int(np.argmax(areas)) + 1
-            bx = int(stats[biggest, cv2.CC_STAT_LEFT])
-            by = int(stats[biggest, cv2.CC_STAT_TOP])
-            bw = int(stats[biggest, cv2.CC_STAT_WIDTH])
-            bh = int(stats[biggest, cv2.CC_STAT_HEIGHT])
-            largest_blob_bbox = (bx, by, bw, bh)
-        else:
-            largest_blob_bbox = raw_bbox
-        debug["n_components"] = max(0, n_labels - 1)
-        debug["largest_blob_bbox"] = largest_blob_bbox
+        # Preprocess and append to the images tensor.
+        new_tensor = _frame_to_sam2_tensor(rgb, self.predictor.image_size)
+        # state["images"] is (N, 3, S, S) on CPU when offload_video_to_cpu=True.
+        state["images"] = torch.cat(
+            [state["images"], new_tensor.unsqueeze(0)], dim=0
+        )
+        state["num_frames"] = state["images"].shape[0]
+        sess["next_frame_idx"] = frame_idx + 1
 
-        # Loud log if raw bbox is much bigger than largest-blob bbox →
-        # stray-pixel inflation is happening.
-        rw, rh = raw_bbox[2], raw_bbox[3]
-        lw, lh = largest_blob_bbox[2], largest_blob_bbox[3]
-        if rw > lw * 1.3 or rh > lh * 1.3:
-            print(f"[segment] STRAY-PIXEL inflation: "
-                  f"raw={raw_bbox} largest_blob={largest_blob_bbox} "
-                  f"n_comp={debug['n_components']}")
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+            gen = self.predictor.propagate_in_video(
+                state,
+                start_frame_idx=frame_idx,
+                max_frame_num_to_track=1,
+            )
+            try:
+                _, _, video_res_masks = next(gen)
+            except StopIteration:
+                return None, {"score": None, "coverage": 0.0,
+                              "n_components": 0, "raw_bbox": None,
+                              "largest_blob_bbox": None}
 
-        print(f"[segment] box={tuple(int(v) for v in box_xyxy)} "
-              f"score={score:.3f} coverage={coverage:.2%} "
-              f"n_comp={debug['n_components']} "
-              f"raw={raw_bbox} largest={largest_blob_bbox}")
+        mask = (video_res_masks[0, 0].cpu().numpy() > 0)
+        bbox, debug = _mask_to_bbox(mask)
 
-        return raw_bbox, debug
+        # Pull SAMURAI's iou + kalman scores out of the most recent
+        # non-cond output (they live on the last frame's compact_current_out).
+        per_obj = state["output_dict_per_obj"]
+        if per_obj:
+            obj_dict = next(iter(per_obj.values()))
+            entry = obj_dict["non_cond_frame_outputs"].get(frame_idx)
+            if entry is not None:
+                iou = entry.get("object_score_logits")
+                kf = entry.get("kf_score")
+                if iou is not None:
+                    try:
+                        debug["score"] = round(float(iou.flatten()[0].item()), 3)
+                    except Exception:
+                        pass
+                if kf is not None:
+                    try:
+                        debug["kf_score"] = round(float(np.asarray(kf).flatten()[0]), 3)
+                    except Exception:
+                        pass
+
+        # Output growth clamp (skipped in raw mode for diagnosis). The seed
+        # for this clamp is the previous bbox.
+        if bbox is not None and not raw_mode and sess["last_bbox"] is not None:
+            px, py, pw, ph = sess["last_bbox"]
+            bx, by, bw, bh = bbox
+            max_w = int(pw * 1.5)   # SAMURAI legitimately tracks deformation;
+            max_h = int(ph * 1.5)   # be looser than the old image-predictor cap
+            if bw > max_w or bh > max_h:
+                print(f"[track] CLAMP growth: ({bw}x{bh}) -> "
+                      f"cap ({max_w}x{max_h}) from prev ({pw}x{ph})")
+                cx, cy = bx + bw // 2, by + bh // 2
+                bw = min(bw, max_w)
+                bh = min(bh, max_h)
+                bx = max(0, cx - bw // 2)
+                by = max(0, cy - bh // 2)
+                bbox = (bx, by, bw, bh)
+
+        if bbox is not None:
+            sess["last_bbox"] = bbox
+
+        debug["frame_idx"] = frame_idx
+        debug["raw_mode"] = raw_mode
+        return bbox, debug
+
+    def _close_session(self, sid):
+        sess = self.sessions.pop(sid, None)
+        if sess is not None:
+            # Drop reference to predictor state so Python can GC the tensors.
+            sess["state"] = None
 
     @modal.asgi_app()
     def fastapi_app(self):
@@ -200,7 +347,8 @@ class TrackerService:
 
         @api.get("/healthz")
         def healthz():
-            return {"ok": True, "sessions": len(self.sessions)}
+            return {"ok": True, "tracker": "samurai-video",
+                    "sessions": len(self.sessions)}
 
         @api.websocket("/ws")
         async def ws(websocket: WebSocket):
@@ -213,35 +361,39 @@ class TrackerService:
                     sid = data.get("session_id", "default")
 
                     if typ == "init":
+                        # Drop any stale session under this id first.
+                        self._close_session(sid)
                         rgb = self._decode(data["frame"])
                         if rgb is None:
                             await websocket.send_text(json.dumps(
-                                {"type": "init_fail", "session_id": sid, "error": "decode"}
+                                {"type": "init_fail", "session_id": sid,
+                                 "error": "decode"}
                             ))
                             continue
                         x1, y1, x2, y2 = data["bbox"]
-                        bbox, debug = self._segment(rgb, (x1, y1, x2, y2))
+                        try:
+                            bbox, debug = self._new_session(sid, rgb, (x1, y1, x2, y2))
+                        except Exception as e:
+                            print(f"[init] EXC sid={sid}: {e!r}")
+                            await websocket.send_text(json.dumps(
+                                {"type": "init_fail", "session_id": sid,
+                                 "error": f"init_exc: {e}"}
+                            ))
+                            continue
                         if bbox is None:
                             await websocket.send_text(json.dumps(
                                 {"type": "init_fail", "session_id": sid,
                                  "error": "no mask", "debug": debug}
                             ))
                             continue
-                        self.sessions[sid] = {
-                            "last_bbox": bbox,
-                            "h": rgb.shape[0],
-                            "w": rgb.shape[1],
-                            "stream": False,
-                        }
+                        print(f"[init] sid={sid} bbox={bbox} "
+                              f"n_comp={debug['n_components']}")
                         await websocket.send_text(json.dumps(
                             {"type": "init_ok", "session_id": sid,
                              "bbox": list(bbox), "debug": debug}
                         ))
 
                     elif typ == "stream":
-                        # Diagnostic: client toggles continuous SAM mode.
-                        # Server-side this is mostly a flag for logging; the
-                        # browser still drives frame cadence via track msgs.
                         if sid in self.sessions:
                             self.sessions[sid]["stream"] = bool(data.get("enabled"))
                             print(f"[stream] sid={sid} -> "
@@ -254,59 +406,43 @@ class TrackerService:
                     elif typ == "track":
                         if sid not in self.sessions:
                             await websocket.send_text(json.dumps(
-                                {"type": "error", "session_id": sid, "error": "no session"}
+                                {"type": "error", "session_id": sid,
+                                 "error": "no session"}
                             ))
                             continue
                         sess = self.sessions[sid]
+                        if sess["next_frame_idx"] >= MAX_FRAMES_PER_SESSION:
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "session_id": sid,
+                                 "error": "session full — please re-prompt"}
+                            ))
+                            continue
                         rgb = self._decode(data["frame"])
                         if rgb is None:
                             await websocket.send_text(json.dumps(
-                                {"type": "bbox", "session_id": sid, "bbox": None, "ms": 0}
+                                {"type": "bbox", "session_id": sid,
+                                 "bbox": None, "ms": 0}
                             ))
                             continue
-                        H, W = rgb.shape[:2]
-                        # Prefer the browser's current local-tracker bbox as the
-                        # prompt seed (constant size, no feedback). Fall back to
-                        # the server's last SAM bbox if the browser didn't send one.
-                        seed_bbox = data.get("bbox") or sess["last_bbox"]
-                        x, y, w, h = seed_bbox
-                        # raw=true → diagnostic mode: skip output clamp so the
-                        # client can see SAM's natural behavior.
                         raw_mode = bool(data.get("raw"))
-                        # Cap expansion at a small absolute pixel value so a large
-                        # bbox doesn't expand into a whole-frame prompt.
-                        mx = min(int(w * 0.15), 24)
-                        my = min(int(h * 0.15), 24)
-                        prompt = (
-                            max(0, x - mx),
-                            max(0, y - my),
-                            min(W, x + w + mx),
-                            min(H, y + h + my),
-                        )
                         t0 = time.time()
-                        bbox, debug = self._segment(rgb, prompt)
-                        # Output growth clamp (skipped in raw mode for diagnosis).
-                        if bbox is not None and not raw_mode:
-                            bx, by, bw, bh = bbox
-                            max_w = int(w * 1.3)
-                            max_h = int(h * 1.3)
-                            if bw > max_w or bh > max_h:
-                                print(f"[track] CLAMP growth: "
-                                      f"({bw}x{bh}) -> cap ({max_w}x{max_h}) "
-                                      f"from seed ({w}x{h})")
-                                cx, cy = bx + bw // 2, by + bh // 2
-                                bw = min(bw, max_w)
-                                bh = min(bh, max_h)
-                                bx = max(0, cx - bw // 2)
-                                by = max(0, cy - bh // 2)
-                                bbox = (bx, by, bw, bh)
+                        try:
+                            bbox, debug = self._track_frame(sid, rgb, raw_mode)
+                        except Exception as e:
+                            print(f"[track] EXC sid={sid}: {e!r}")
+                            await websocket.send_text(json.dumps(
+                                {"type": "bbox", "session_id": sid,
+                                 "bbox": None, "ms": 0,
+                                 "debug": {"error": f"track_exc: {e}"}}
+                            ))
+                            continue
                         dt_ms = int((time.time() - t0) * 1000)
-                        if bbox is not None:
-                            sess["last_bbox"] = bbox
-                        # Echo the prompt & seed so the client can overlay them.
-                        debug["seed_bbox"] = list(seed_bbox)
-                        debug["prompt_xyxy"] = list(prompt)
-                        debug["raw_mode"] = raw_mode
+                        debug["ms"] = dt_ms
+                        # seed_bbox for client overlay continuity (the previous
+                        # bbox is what the client should think of as the seed).
+                        debug["seed_bbox"] = (
+                            list(sess["last_bbox"]) if sess["last_bbox"] else None
+                        )
                         await websocket.send_text(json.dumps(
                             {"type": "bbox", "session_id": sid,
                              "bbox": list(bbox) if bbox else None,
@@ -314,7 +450,7 @@ class TrackerService:
                         ))
 
                     elif typ == "close":
-                        self.sessions.pop(sid, None)
+                        self._close_session(sid)
                         await websocket.send_text(json.dumps(
                             {"type": "closed", "session_id": sid}
                         ))

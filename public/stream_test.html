@@ -115,8 +115,8 @@
     <canvas id="overlay"></canvas>
     <div id="legend">
       <div><span class="sw" style="background:#ff3b30"></span>local tracker (every frame)</div>
-      <div><span class="sw" style="background:#0af"></span>SAM 2 snap</div>
-      <div><span class="sw" style="background:#f1c40f"></span>SAM prompt seed (diag)</div>
+      <div><span class="sw" style="background:#0af"></span>SAMURAI snap (~6 Hz max)</div>
+      <div><span class="sw" style="background:#f1c40f"></span>previous SAMURAI bbox (diag)</div>
     </div>
   </div>
 
@@ -577,9 +577,11 @@
       const fmt = (b) => b ? `[${b[0]},${b[1]} ${b[2]}×${b[3]}]` : '—';
       $stats.textContent = [
         `score=${d.score ?? '—'}`,
+        `kf=${d.kf_score ?? '—'}`,
         `cov=${d.coverage != null ? (d.coverage * 100).toFixed(1) + '%' : '—'}`,
         `n_comp=${d.n_components ?? '—'}`,
-        `seed=${fmt(d.seed_bbox)}`,
+        `ms=${d.ms ?? '—'}`,
+        `prev=${fmt(d.seed_bbox)}`,
         `raw=${fmt(d.raw_bbox)}`,
         `largest=${fmt(d.largest_blob_bbox)}`,
       ].join('  ');
