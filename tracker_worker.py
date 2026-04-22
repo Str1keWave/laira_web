@@ -57,11 +57,21 @@ CHECKPOINT_PATH = "/root/checkpoints/sam2.1_hiera_base_plus.pt"
 # SAMURAI ships its own configs that wire the Kalman-augmented memory selection.
 CFG = "configs/samurai/sam2.1_hiera_b+.yaml"
 
-# Frames per session before we start dropping the oldest from the in-memory
-# tensor. The model's memory bank only uses ~7 of these anyway; we just need
-# the frame_idx accounting to stay valid. With offload_video_to_cpu=True each
-# 1024x1024 frame is ~12MB on CPU RAM, so 600 ≈ 7GB cap.
-MAX_FRAMES_PER_SESSION = 600
+# Pruning windows. Sessions are unbounded in length; per-session memory is
+# bounded by these constants instead of by a hard frame cap.
+#
+# IMAGES_KEEP_RECENT — number of recent raw frames to retain in
+# state["images"] (each ~12MB on CPU). We always keep frame 0 too as the
+# conditioning anchor. SAMURAI's memory bank attends over the cached
+# maskmem_features (in output_dict), NOT raw images, so old images can be
+# dropped immediately after the frame is processed. Keeping a small window
+# is purely defensive in case the predictor ever re-fetches.
+IMAGES_KEEP_RECENT = 3
+# OUTPUT_KEEP — how many recent non-conditioning per-frame outputs to keep
+# in the memory bank. The model only uses ~7 of these via SAMURAI's
+# motion-aware selection, but keep a generous window so selection has room
+# to reach further back when motion is stable. Each entry is ~0.5MB.
+OUTPUT_KEEP = 60
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -186,9 +196,10 @@ class TrackerService:
         # produced by predictor.init_state(), plus our bookkeeping.
         self.sessions: dict = {}
 
-        # Warmup: build a dummy state from a 1-frame temp dir and run a box
-        # prompt + 1-frame propagation. Front-loads the autograd graph build
-        # and CUDA kernel compilation so the first real init isn't a 3s outlier.
+        # Warmup: exercise the full streaming pipeline once on a dummy frame
+        # so the first real session doesn't pay JIT/kernel-compile latency
+        # AND so any breakage in the dict-images path fails at boot, not on
+        # the first user-facing request.
         with tempfile.TemporaryDirectory() as tdir:
             dummy = (np.random.rand(480, 640, 3) * 255).astype(np.uint8)
             cv2.imwrite(os.path.join(tdir, "00000.jpg"),
@@ -200,7 +211,18 @@ class TrackerService:
                     state, frame_idx=0, obj_id=0,
                     box=np.array([100, 100, 300, 300], dtype=np.float32),
                 )
-        print("[TrackerService] SAMURAI ready")
+                # Convert images to dict and run one streaming-style frame
+                # through propagate_in_video. This validates the dict path.
+                state["images"] = {0: state["images"][0]}
+                state["images"][1] = _frame_to_sam2_tensor(
+                    dummy, self.predictor.image_size
+                )
+                state["num_frames"] = 2
+                gen = self.predictor.propagate_in_video(
+                    state, start_frame_idx=1, max_frame_num_to_track=1,
+                )
+                next(gen)
+        print("[TrackerService] SAMURAI ready (streaming path validated)")
 
     # ---------- helpers ----------
     def _decode(self, b64_jpg: str):
@@ -239,6 +261,12 @@ class TrackerService:
         if bbox is None:
             return None, debug
 
+        # Convert state["images"] from a (1, 3, S, S) tensor into a dict
+        # keyed by frame_idx. The predictor only does state["images"][i] in
+        # _get_image_feature, which works on either a tensor or a dict — but
+        # a dict lets us drop old entries without renumbering frame indices.
+        state["images"] = {0: state["images"][0]}
+
         self.sessions[sid] = {
             "state": state,
             "next_frame_idx": 1,   # 0 was the init frame
@@ -247,6 +275,44 @@ class TrackerService:
             "stream": False,
         }
         return bbox, debug
+
+    def _prune_session(self, state, current_frame_idx):
+        """Drop old per-frame storage to bound per-session RAM.
+
+        Safe because:
+          - state["images"][K] is only re-read by _get_image_feature on
+            cache miss, and we only ever process frame indices forward.
+            After frame K is propagated, its image isn't needed again.
+          - The memory bank attends over maskmem_features stored in
+            output_dict, not raw images, so dropping old images doesn't
+            affect tracking quality.
+          - We never prune frame 0's storage — it's the conditioning anchor.
+          - non_cond_frame_outputs entries older than the model's effective
+            memory window are dead weight.
+        """
+        # 1) Raw images: keep frame 0 + a small recent window.
+        images = state["images"]
+        keep_set = {0, *range(
+            max(0, current_frame_idx - IMAGES_KEEP_RECENT + 1),
+            current_frame_idx + 1,
+        )}
+        for k in [k for k in images if k not in keep_set]:
+            del images[k]
+
+        # 2) Output dict bookkeeping: drop non-conditioning entries older
+        # than OUTPUT_KEEP frames. cond_frame_outputs (frame 0) untouched.
+        cutoff = current_frame_idx - OUTPUT_KEEP
+        if cutoff > 0:
+            ncfo = state["output_dict"]["non_cond_frame_outputs"]
+            for k in [k for k in ncfo if k < cutoff]:
+                del ncfo[k]
+            for obj_dict in state["output_dict_per_obj"].values():
+                ncfo_obj = obj_dict["non_cond_frame_outputs"]
+                for k in [k for k in ncfo_obj if k < cutoff]:
+                    del ncfo_obj[k]
+            fat = state["frames_already_tracked"]
+            for k in [k for k in fat if k < cutoff]:
+                del fat[k]
 
     def _track_frame(self, sid, rgb, raw_mode):
         """Append a frame to the session and run one propagation step.
@@ -257,13 +323,12 @@ class TrackerService:
         state = sess["state"]
         frame_idx = sess["next_frame_idx"]
 
-        # Preprocess and append to the images tensor.
+        # state["images"] is now a dict {frame_idx: tensor(3, S, S)} after
+        # _new_session converted it from the init tensor. Insert the new
+        # frame and bump num_frames so propagate_in_video's range() is right.
         new_tensor = _frame_to_sam2_tensor(rgb, self.predictor.image_size)
-        # state["images"] is (N, 3, S, S) on CPU when offload_video_to_cpu=True.
-        state["images"] = torch.cat(
-            [state["images"], new_tensor.unsqueeze(0)], dim=0
-        )
-        state["num_frames"] = state["images"].shape[0]
+        state["images"][frame_idx] = new_tensor
+        state["num_frames"] = frame_idx + 1
         sess["next_frame_idx"] = frame_idx + 1
 
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
@@ -278,6 +343,9 @@ class TrackerService:
                 return None, {"score": None, "coverage": 0.0,
                               "n_components": 0, "raw_bbox": None,
                               "largest_blob_bbox": None}
+
+        # Prune old per-frame storage now that this frame is processed.
+        self._prune_session(state, frame_idx)
 
         mask = (video_res_masks[0, 0].cpu().numpy() > 0)
         bbox, debug = _mask_to_bbox(mask)
@@ -411,12 +479,6 @@ class TrackerService:
                             ))
                             continue
                         sess = self.sessions[sid]
-                        if sess["next_frame_idx"] >= MAX_FRAMES_PER_SESSION:
-                            await websocket.send_text(json.dumps(
-                                {"type": "error", "session_id": sid,
-                                 "error": "session full — please re-prompt"}
-                            ))
-                            continue
                         rgb = self._decode(data["frame"])
                         if rgb is None:
                             await websocket.send_text(json.dumps(
