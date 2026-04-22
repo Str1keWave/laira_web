@@ -4,6 +4,88 @@ const app = express();
 const revai = require('revai-node-sdk');
 
 app.use(express.static('public'));
+// Frames are sent as base64 JPEG in /api/t1; bump the JSON limit accordingly.
+app.use(express.json({ limit: '10mb' }));
+
+// === /stream_test demo page (LaiRA visual pipeline test) ===
+app.get('/stream_test', (req, res) => {
+  res.sendFile(__dirname + '/public/stream_test.html');
+});
+
+// Browser asks for the runtime config (Modal tracker URL, etc.) on page load.
+app.get('/api/config', (req, res) => {
+  res.json({
+    modalTrackerUrl: process.env.MODAL_TRACKER_URL || '',
+  });
+});
+
+// T1: given a JPEG frame + a user message, ask Claude Opus for a target bbox.
+// Returns { bbox: [x1,y1,x2,y2] | null, reasoning: string }.
+app.post('/api/t1', async (req, res) => {
+  try {
+    const { frame, message, width, height } = req.body || {};
+    if (!frame || !message) {
+      return res.status(400).json({ error: 'missing frame or message' });
+    }
+    const apiKey = process.env.T1_PROMPT_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'T1_PROMPT_KEY not set on server' });
+    }
+
+    const systemPrompt = [
+      "You are LaiRA's vision T1 module. You receive a single video frame and a",
+      "tracking command from the user. Identify the target object the user is",
+      "referring to, and return a single JSON object — no surrounding text — of",
+      "the form:",
+      '  {"bbox": [x1, y1, x2, y2], "reasoning": "brief explanation"}',
+      "Coordinates are integer pixels in the image's native resolution",
+      `(image width=${width || 'unknown'}, height=${height || 'unknown'}).`,
+      "The bbox should fully contain the target with a small margin (~10px).",
+      "If you cannot identify the target with confidence, return:",
+      '  {"bbox": null, "reasoning": "why not"}',
+    ].join('\n');
+
+    const anthropicResp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-7',
+        max_tokens: 512,
+        system: systemPrompt,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: frame } },
+            { type: 'text', text: message },
+          ],
+        }],
+      }),
+    });
+
+    if (!anthropicResp.ok) {
+      const errText = await anthropicResp.text();
+      console.error('Anthropic error', anthropicResp.status, errText);
+      return res.status(502).json({ error: 'anthropic_error', status: anthropicResp.status, detail: errText });
+    }
+
+    const payload = await anthropicResp.json();
+    const text = (payload.content || []).map(b => b.text || '').join('').trim();
+    // Extract first {...} JSON object from the response.
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) {
+      return res.status(502).json({ error: 'no_json_in_response', raw: text });
+    }
+    const parsed = JSON.parse(m[0]);
+    return res.json(parsed);
+  } catch (err) {
+    console.error('/api/t1 error', err);
+    return res.status(500).json({ error: 'server_error', detail: String(err) });
+  }
+});
 
 // Serve user and laira pages at '/user' and '/laira'
 app.get('/user', (req, res) => {
