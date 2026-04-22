@@ -173,7 +173,9 @@
       $prompt.disabled = !ready;
       $send.disabled = !ready;
       if (ready) {
-        if (!state.tracking) {
+        if (state.tracking) {
+          $prompt.placeholder = 'tracking — type a new prompt to retarget';
+        } else {
           $prompt.placeholder = 'e.g. "follow me" — press enter';
           $prompt.focus();
         }
@@ -261,9 +263,32 @@
     }
 
     // ---------- 5) submit prompt ----------
+    function stopTracking() {
+      // Cleanly tear down the active session so we can start a fresh T1 flow.
+      state.tracking = false;
+      state.sentInFlight = false;
+      state.lastBbox = null;
+      state.lastSamBbox = null;
+      if (state.template) { state.template.delete(); state.template = null; }
+      ctx.clearRect(0, 0, $overlay.width, $overlay.height);
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        try {
+          state.ws.send(JSON.stringify({
+            type: 'close', session_id: state.sessionId,
+          }));
+        } catch (_) { /* ignore */ }
+      }
+      // Fresh session id so the server treats the next init as brand new.
+      state.sessionId = 'sess-' + Math.random().toString(36).slice(2, 10);
+    }
+
     async function onSubmit() {
       const message = $prompt.value.trim();
       if (!message) return;
+      // If we're already tracking, the user wants to retarget — cut the flow.
+      if (state.tracking) {
+        stopTracking();
+      }
       $send.disabled = true;
       $prompt.disabled = true;
       setStatus('asking T1 (Claude Opus) for the target bbox…');
@@ -293,6 +318,9 @@
         await initSamSession(frameJpegB64, [x1, y1, x2, y2]);
         seedLocalTracker(bbox);
         state.tracking = true;
+        $prompt.value = '';
+        // Re-enable the prompt so the user can retarget mid-tracking.
+        maybeEnableUI();
         requestAnimationFrame(trackLoop);
       } catch (err) {
         setStatus('T1 error: ' + err.message);
@@ -339,8 +367,12 @@
       if (state.sentInFlight) return;
       const frameJpegB64 = grabFrameJpegB64(0.7);
       state.sentInFlight = true;
+      // Include the browser's current local-tracker bbox as the prompt seed.
+      // Because matchTemplate keeps a fixed-size template, this bbox doesn't
+      // grow frame-to-frame, which breaks any mask-expansion feedback loop.
       state.ws.send(JSON.stringify({
         type: 'track', session_id: state.sessionId, frame: frameJpegB64,
+        bbox: state.lastBbox || undefined,
       }));
     }
 

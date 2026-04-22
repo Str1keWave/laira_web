@@ -16,7 +16,8 @@ Protocol (JSON over websocket /ws):
   c->s: {"type":"init",  "session_id":str, "frame":b64jpg, "bbox":[x1,y1,x2,y2]}
   s->c: {"type":"init_ok",   "session_id":str, "bbox":[x,y,w,h]}
   s->c: {"type":"init_fail", "session_id":str, "error":str}
-  c->s: {"type":"track", "session_id":str, "frame":b64jpg}
+  c->s: {"type":"track", "session_id":str, "frame":b64jpg,
+         "bbox":[x,y,w,h] | omitted}   # if provided, used as prompt seed
   s->c: {"type":"bbox",  "session_id":str, "bbox":[x,y,w,h]|null, "ms":int}
   c->s: {"type":"close", "session_id":str}
 
@@ -104,17 +105,32 @@ class TrackerService:
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     def _segment(self, rgb, box_xyxy):
-        """Run SAM 2 image predictor with a box prompt; return (x,y,w,h) or None."""
+        """Run SAM 2 image predictor with a box prompt; return (x,y,w,h) or None.
+
+        Rejects masks that cover >70% of the frame — those are almost always
+        SAM picking up the background rather than the object, and snapping
+        the local tracker to a whole-frame bbox kills tracking.
+        """
+        H, W = rgb.shape[:2]
+        img_area = H * W
         with torch.inference_mode():
             self.predictor.set_image(rgb)
-            masks, _, _ = self.predictor.predict(
+            masks, scores, _ = self.predictor.predict(
                 box=np.array(box_xyxy, dtype=np.float32),
                 multimask_output=False,
             )
         m = masks[0] > 0
-        nz = np.argwhere(m)
-        if len(nz) == 0:
+        mask_area = int(m.sum())
+        coverage = mask_area / img_area if img_area else 0.0
+        score = float(scores[0]) if len(scores) else 0.0
+        print(f"[segment] box={tuple(int(v) for v in box_xyxy)} "
+              f"score={score:.3f} coverage={coverage:.2%}")
+        if mask_area == 0:
             return None
+        if coverage > 0.70:
+            print(f"[segment] REJECT mask: coverage {coverage:.2%} > 70%")
+            return None
+        nz = np.argwhere(m)
         y1, x1 = nz.min(axis=0)
         y2, x2 = nz.max(axis=0)
         return int(x1), int(y1), int(x2 - x1), int(y2 - y1)
@@ -183,8 +199,16 @@ class TrackerService:
                             ))
                             continue
                         H, W = rgb.shape[:2]
-                        x, y, w, h = sess["last_bbox"]
-                        mx, my = int(w * 0.3), int(h * 0.3)
+                        # Prefer the browser's current local-tracker bbox as the
+                        # prompt seed (constant size, no feedback). Fall back to
+                        # the server's last SAM bbox if the browser didn't send one.
+                        seed_bbox = data.get("bbox") or sess["last_bbox"]
+                        x, y, w, h = seed_bbox
+                        # Cap expansion at a small absolute pixel value so a large
+                        # bbox doesn't expand into a whole-frame prompt (which makes
+                        # SAM 2 segment the entire foreground).
+                        mx = min(int(w * 0.15), 24)
+                        my = min(int(h * 0.15), 24)
                         prompt = (
                             max(0, x - mx),
                             max(0, y - my),
@@ -193,6 +217,24 @@ class TrackerService:
                         )
                         t0 = time.time()
                         bbox = self._segment(rgb, prompt)
+                        # Clamp output growth: never let SAM return a bbox more
+                        # than 1.3x the seed in either dimension. Tightening
+                        # (shrinking) is fine; runaway expansion is the bug.
+                        if bbox is not None:
+                            bx, by, bw, bh = bbox
+                            max_w = int(w * 1.3)
+                            max_h = int(h * 1.3)
+                            if bw > max_w or bh > max_h:
+                                print(f"[track] CLAMP growth: "
+                                      f"({bw}x{bh}) -> cap ({max_w}x{max_h}) "
+                                      f"from seed ({w}x{h})")
+                                # Keep center, cap dims
+                                cx, cy = bx + bw // 2, by + bh // 2
+                                bw = min(bw, max_w)
+                                bh = min(bh, max_h)
+                                bx = max(0, cx - bw // 2)
+                                by = max(0, cy - bh // 2)
+                                bbox = (bx, by, bw, bh)
                         dt_ms = int((time.time() - t0) * 1000)
                         if bbox is not None:
                             sess["last_bbox"] = bbox
