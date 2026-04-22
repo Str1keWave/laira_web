@@ -25,10 +25,28 @@
       position: absolute; top: 0; left: 0;
       pointer-events: none;
     }
-    #status {
-      margin: 12px 0 6px;
-      font-size: 13px;
+    #status-list {
+      display: grid;
+      grid-template-columns: auto auto;
+      gap: 4px 12px;
+      margin: 12px 0 4px;
+      font-size: 12px;
       color: #aaa;
+    }
+    #status-list .label  { text-align: right; }
+    #status-list .value  { display: flex; align-items: center; gap: 6px; }
+    #status-list .dot {
+      display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+      background: #555;
+    }
+    .dot.ok   { background: #2ecc71; }
+    .dot.busy { background: #f1c40f; animation: pulse 1.4s infinite; }
+    .dot.err  { background: #e74c3c; }
+    @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.35 } }
+    #status {
+      margin: 4px 0 6px;
+      font-size: 13px;
+      color: #ccc;
       min-height: 18px;
       max-width: 90vw;
       text-align: center;
@@ -46,6 +64,7 @@
       border: 1px solid #444;
       background: #1c1c1c; color: #eee;
     }
+    #prompt:disabled { color: #777; background: #181818; }
     #send {
       padding: 10px 16px;
       background: #2b6cb0; color: white;
@@ -64,7 +83,19 @@
 </head>
 <body>
   <h2 style="margin: 16px 0 6px">LaiRA stream_test</h2>
-  <div id="status">initializing…</div>
+
+  <div id="status-list">
+    <div class="label">webcam</div>
+    <div class="value"><span class="dot" id="dot-camera"></span><span id="lbl-camera">off</span></div>
+    <div class="label">opencv.js</div>
+    <div class="value"><span class="dot" id="dot-cv"></span><span id="lbl-cv">loading…</span></div>
+    <div class="label">server config</div>
+    <div class="value"><span class="dot" id="dot-config"></span><span id="lbl-config">fetching…</span></div>
+    <div class="label">SAM 2 (Modal)</div>
+    <div class="value"><span class="dot" id="dot-modal"></span><span id="lbl-modal">checking…</span></div>
+  </div>
+
+  <div id="status"></div>
 
   <div id="stage">
     <video id="video" autoplay playsinline muted></video>
@@ -76,12 +107,12 @@
   </div>
 
   <div id="prompt-row">
-    <input id="prompt" placeholder='e.g. "follow me" — press enter once webcam is live'
+    <input id="prompt" placeholder='waiting on dependencies…'
            autocomplete="off" disabled />
     <button id="send" disabled>Send</button>
   </div>
 
-  <!-- OpenCV.js for matchTemplate-based browser tracker.  -->
+  <!-- OpenCV.js for matchTemplate-based browser tracker. -->
   <script async src="https://docs.opencv.org/4.10.0/opencv.js" id="opencvjs"></script>
 
   <script>
@@ -93,10 +124,15 @@
     const $send    = document.getElementById('send');
     const ctx = $overlay.getContext('2d');
 
-    // Track UI/runtime state in one bag so callbacks stay legible.
+    // Component readiness — gates the prompt UI.
+    const components = {
+      camera: 'busy',  // 'busy' | 'ok' | 'err'
+      cv:     'busy',
+      config: 'busy',
+      modal:  'busy',
+    };
+
     const state = {
-      cvReady:        false,
-      videoReady:     false,
       modalUrl:       null,
       ws:             null,            // WebSocket to Modal tracker
       sessionId:      'sess-' + Math.random().toString(36).slice(2, 10),
@@ -108,15 +144,49 @@
       sentInFlight:   false,           // throttle so we don't queue Modal calls
       lastSamBbox:    null,            // for cyan flash overlay
       lastSamAt:      0,
+      reconnectTried: false,           // one-shot WS reconnect on drop
     };
 
     function setStatus(msg) {
       $status.textContent = msg;
-      console.log('[status]', msg);
+      if (msg) console.log('[status]', msg);
+    }
+
+    function setComponent(name, status, label) {
+      components[name] = status;
+      const dot = document.getElementById('dot-' + name);
+      const lbl = document.getElementById('lbl-' + name);
+      if (dot) {
+        dot.classList.remove('ok', 'busy', 'err');
+        dot.classList.add(status);
+      }
+      if (lbl) lbl.textContent = label;
+      maybeEnableUI();
+    }
+
+    function allReady() {
+      return Object.values(components).every(s => s === 'ok');
+    }
+
+    function maybeEnableUI() {
+      const ready = allReady();
+      $prompt.disabled = !ready;
+      $send.disabled = !ready;
+      if (ready) {
+        if (!state.tracking) {
+          $prompt.placeholder = 'e.g. "follow me" — press enter';
+          $prompt.focus();
+        }
+      } else {
+        const waiting = Object.entries(components)
+          .filter(([_, s]) => s !== 'ok').map(([n]) => n);
+        $prompt.placeholder = 'waiting on: ' + waiting.join(', ');
+      }
     }
 
     // ---------- 1) webcam ----------
     async function startWebcam() {
+      setComponent('camera', 'busy', 'requesting permission…');
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: 640 }, height: { ideal: 480 } },
@@ -126,47 +196,70 @@
         await new Promise(r => $video.addEventListener('loadedmetadata', r, { once: true }));
         $overlay.width = $video.videoWidth;
         $overlay.height = $video.videoHeight;
-        state.videoReady = true;
-        maybeEnableUI();
+        setComponent('camera', 'ok', `live (${$video.videoWidth}×${$video.videoHeight})`);
       } catch (err) {
-        setStatus('webcam blocked: ' + err.message);
+        setComponent('camera', 'err', 'blocked: ' + err.message);
       }
     }
 
     // ---------- 2) opencv.js ----------
     window.Module = {
       onRuntimeInitialized() {
-        state.cvReady = true;
-        maybeEnableUI();
+        setComponent('cv', 'ok', 'ready');
       }
     };
+    // If opencv.js fails to load entirely, mark the component errored.
+    document.getElementById('opencvjs').addEventListener('error', () => {
+      setComponent('cv', 'err', 'failed to load');
+    });
 
     // ---------- 3) config ----------
     async function loadConfig() {
-      const resp = await fetch('/api/config');
-      const cfg = await resp.json();
-      state.modalUrl = cfg.modalTrackerUrl;
+      setComponent('config', 'busy', 'fetching…');
+      try {
+        const resp = await fetch('/api/config');
+        const cfg = await resp.json();
+        if (!cfg.modalTrackerUrl) {
+          setComponent('config', 'err', 'MODAL_TRACKER_URL not set on server');
+          return;
+        }
+        state.modalUrl = cfg.modalTrackerUrl;
+        setComponent('config', 'ok', 'loaded');
+      } catch (err) {
+        setComponent('config', 'err', err.message);
+      }
+    }
+
+    // ---------- 4) Modal pre-warm ----------
+    // First call after idle takes ~30s while the GPU container cold-boots.
+    // Hit /healthz on page load so the server is warm by the time the user submits.
+    async function prewarmModal() {
       if (!state.modalUrl) {
-        setStatus('MODAL_TRACKER_URL is not set on the server');
+        setComponent('modal', 'err', 'no URL');
+        return;
+      }
+      setComponent('modal', 'busy', 'warming up (≤60s on cold start)…');
+      const url = state.modalUrl + '/healthz';
+      const ctrl = new AbortController();
+      const timeout = setTimeout(() => ctrl.abort(), 90000);
+      try {
+        const t0 = performance.now();
+        const resp = await fetch(url, { signal: ctrl.signal });
+        clearTimeout(timeout);
+        if (!resp.ok) {
+          setComponent('modal', 'err', 'healthz http ' + resp.status);
+          return;
+        }
+        const dt = Math.round((performance.now() - t0) / 100) / 10;
+        setComponent('modal', 'ok', `ready (${dt}s)`);
+      } catch (err) {
+        clearTimeout(timeout);
+        setComponent('modal', 'err',
+          err.name === 'AbortError' ? 'timed out after 90s' : err.message);
       }
     }
 
-    function maybeEnableUI() {
-      if (state.cvReady && state.videoReady && state.modalUrl) {
-        setStatus('webcam live. type a tracking prompt and press enter.');
-        $prompt.disabled = false;
-        $send.disabled = false;
-        $prompt.focus();
-      } else {
-        const waiting = [];
-        if (!state.videoReady) waiting.push('webcam');
-        if (!state.cvReady)    waiting.push('opencv.js');
-        if (!state.modalUrl)   waiting.push('config');
-        setStatus('waiting on: ' + waiting.join(', '));
-      }
-    }
-
-    // ---------- 4) submit prompt ----------
+    // ---------- 5) submit prompt ----------
     async function onSubmit() {
       const message = $prompt.value.trim();
       if (!message) return;
@@ -185,7 +278,7 @@
         const data = await resp.json();
         if (!resp.ok || !data.bbox) {
           setStatus('T1 did not return a bbox: ' + (data.reasoning || data.error || JSON.stringify(data)));
-          $prompt.disabled = false; $send.disabled = false;
+          maybeEnableUI();
           return;
         }
         const [x1, y1, x2, y2] = data.bbox;
@@ -202,32 +295,31 @@
         requestAnimationFrame(trackLoop);
       } catch (err) {
         setStatus('T1 error: ' + err.message);
-        $prompt.disabled = false; $send.disabled = false;
+        maybeEnableUI();
       }
     }
 
     $send.addEventListener('click', onSubmit);
     $prompt.addEventListener('keydown', e => { if (e.key === 'Enter') onSubmit(); });
 
-    // ---------- 5) frame grab ----------
+    // ---------- 6) frame grab ----------
     function grabFrameJpegB64(quality) {
       const c = document.createElement('canvas');
       c.width = $video.videoWidth;
       c.height = $video.videoHeight;
       c.getContext('2d').drawImage($video, 0, 0);
-      // Strip the "data:image/jpeg;base64," prefix.
       return c.toDataURL('image/jpeg', quality).split(',', 2)[1];
     }
 
-    // ---------- 6) Modal websocket ----------
+    // ---------- 7) Modal websocket ----------
     function openSamWs() {
       return new Promise((resolve, reject) => {
         const wsUrl = state.modalUrl.replace(/^http/, 'ws') + '/ws';
         const ws = new WebSocket(wsUrl);
         ws.onopen = () => resolve(ws);
-        ws.onerror = e => reject(new Error('ws error'));
+        ws.onerror = () => reject(new Error('ws error'));
         ws.onmessage = e => onSamMessage(JSON.parse(e.data));
-        ws.onclose = () => { state.ws = null; };
+        ws.onclose = onSamClose;
       });
     }
 
@@ -255,22 +347,62 @@
       if (msg.type === 'init_ok') {
         setStatus('SAM 2 session ready. tracking…');
       } else if (msg.type === 'init_fail') {
-        setStatus('SAM 2 init failed: ' + (msg.error || ''));
+        setStatus('SAM 2 init failed (' + (msg.error || '') + ') — try a different prompt');
+        state.tracking = false;
+        maybeEnableUI();
       } else if (msg.type === 'bbox') {
         state.sentInFlight = false;
         if (msg.bbox) {
           state.lastSamBbox = msg.bbox;
           state.lastSamAt = performance.now();
-          // Snap local tracker template to the new bbox.
           seedLocalTracker(msg.bbox);
         }
       } else if (msg.type === 'error') {
         state.sentInFlight = false;
-        console.warn('SAM ws error', msg);
+        if (msg.error === 'no session' && state.tracking && state.lastBbox) {
+          // Modal restarted and lost our session — re-init from current local bbox.
+          console.warn('SAM session lost, re-initing');
+          const [x, y, w, h] = state.lastBbox;
+          initSamSession(grabFrameJpegB64(0.85), [x, y, x + w, y + h]);
+        } else {
+          console.warn('SAM ws error', msg);
+        }
       }
     }
 
-    // ---------- 7) local tracker (cv.matchTemplate over a search window) ----------
+    async function onSamClose() {
+      const wasTracking = state.tracking;
+      state.ws = null;
+      if (!wasTracking) return;
+      // Auto-reconnect once. If that fails, drop tracking and re-enable the prompt.
+      if (state.reconnectTried) {
+        state.tracking = false;
+        setStatus('SAM 2 connection lost twice — stopping. Re-submit a prompt to retry.');
+        maybeEnableUI();
+        return;
+      }
+      state.reconnectTried = true;
+      setStatus('SAM 2 disconnected — reconnecting…');
+      try {
+        state.ws = await openSamWs();
+        if (state.lastBbox) {
+          const [x, y, w, h] = state.lastBbox;
+          state.ws.send(JSON.stringify({
+            type: 'init', session_id: state.sessionId,
+            frame: grabFrameJpegB64(0.85), bbox: [x, y, x + w, y + h],
+          }));
+          // Allow another reconnect later if this connection also drops.
+          setTimeout(() => { state.reconnectTried = false; }, 30000);
+          setStatus('SAM 2 reconnected — resuming tracking');
+        }
+      } catch (err) {
+        state.tracking = false;
+        setStatus('SAM 2 reconnect failed: ' + err.message);
+        maybeEnableUI();
+      }
+    }
+
+    // ---------- 8) local tracker (cv.matchTemplate over a search window) ----------
     function seedLocalTracker(bbox) {
       const [x, y, w, h] = bbox;
       if (w <= 4 || h <= 4) return;
@@ -297,7 +429,6 @@
       const frame = cv.imread(c);
       const fg = new cv.Mat();
       cv.cvtColor(frame, fg, cv.COLOR_RGBA2GRAY);
-      // Search window: 2x bbox dims around last bbox center.
       const cx = lx + lw / 2, cy = ly + lh / 2;
       const sw = Math.min(fg.cols, lw * 3);
       const sh = Math.min(fg.rows, lh * 3);
@@ -325,7 +456,6 @@
         ctx.lineWidth = 2;
         ctx.strokeRect(x, y, w, h);
       }
-      // Flash the SAM bbox in cyan for ~250ms after each snap.
       if (state.lastSamBbox && performance.now() - state.lastSamAt < 250) {
         const [x, y, w, h] = state.lastSamBbox;
         ctx.strokeStyle = '#00aaff';
@@ -334,7 +464,7 @@
       }
     }
 
-    // ---------- 8) main loop ----------
+    // ---------- 9) main loop ----------
     function trackLoop(t) {
       if (!state.tracking) return;
       trackLocal();
@@ -347,10 +477,11 @@
     }
 
     // ---------- bootstrap ----------
-    (async () => {
-      await Promise.all([startWebcam(), loadConfig()]);
-      maybeEnableUI();
-    })();
+    // Camera + opencv.js + config can all start in parallel.
+    // Modal pre-warm waits on config since it needs the URL.
+    startWebcam();
+    loadConfig().then(prewarmModal);
+    maybeEnableUI();
   })();
   </script>
 </body>
