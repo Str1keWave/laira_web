@@ -2,7 +2,14 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>LaiRA stream_test — visual pipeline demo</title>
+  <title>LaiRA stream_test — SAMURAI-only tracking demo</title>
+  <!--
+    SAMURAI-only diagnostic page. Was a two-tier demo (browser CSRT/matchTemplate
+    snapped by periodic SAMURAI calls); the local tracker tier was dropped after
+    the L4 + offload-removal made SAMURAI fast enough on its own. Now: type a
+    prompt, vision returns a bbox, SAMURAI streams bboxes back as fast as the
+    pipeline allows, page draws the result.
+  -->
   <style>
     html, body {
       margin: 0; padding: 0; background: #111; color: #eee;
@@ -79,13 +86,6 @@
       font-size: 11px; line-height: 1.5;
     }
     .sw { display: inline-block; width: 10px; height: 10px; vertical-align: middle; margin-right: 4px; }
-    #controls {
-      display: flex; gap: 16px; align-items: center;
-      margin: 6px 0 0;
-      font-size: 12px; color: #bbb;
-    }
-    #controls label { cursor: pointer; user-select: none; }
-    #controls input { vertical-align: middle; margin-right: 4px; }
     #stats {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 11px; color: #888;
@@ -100,11 +100,9 @@
   <div id="status-list">
     <div class="label">webcam</div>
     <div class="value"><span class="dot" id="dot-camera"></span><span id="lbl-camera">off</span></div>
-    <div class="label">opencv.js</div>
-    <div class="value"><span class="dot" id="dot-cv"></span><span id="lbl-cv">loading…</span></div>
     <div class="label">server config</div>
     <div class="value"><span class="dot" id="dot-config"></span><span id="lbl-config">fetching…</span></div>
-    <div class="label">SAM 2 (Modal)</div>
+    <div class="label">SAMURAI (Modal)</div>
     <div class="value"><span class="dot" id="dot-modal"></span><span id="lbl-modal">checking…</span></div>
   </div>
 
@@ -114,16 +112,11 @@
     <video id="video" autoplay playsinline muted></video>
     <canvas id="overlay"></canvas>
     <div id="legend">
-      <div><span class="sw" style="background:#ff3b30"></span>local tracker (every frame)</div>
-      <div><span class="sw" style="background:#0af"></span>SAMURAI snap (~6 Hz max)</div>
-      <div><span class="sw" style="background:#f1c40f"></span>previous SAMURAI bbox (diag)</div>
+      <div><span class="sw" style="background:#00aaff"></span>SAMURAI bbox</div>
+      <div><span class="sw" style="background:#f1c40f"></span>vision-found seed</div>
     </div>
   </div>
 
-  <div id="controls">
-    <label><input type="checkbox" id="toggle-sam-off" />disable SAM snap</label>
-    <label><input type="checkbox" id="toggle-sam-only" />SAM-only continuous (raw, no clamp)</label>
-  </div>
   <div id="stats"></div>
 
   <div id="prompt-row">
@@ -131,9 +124,6 @@
            autocomplete="off" disabled />
     <button id="send" disabled>Send</button>
   </div>
-
-  <!-- OpenCV.js for matchTemplate-based browser tracker. -->
-  <script async src="https://docs.opencv.org/4.10.0/opencv.js" id="opencvjs"></script>
 
   <script>
   (() => {
@@ -143,14 +133,11 @@
     const $prompt   = document.getElementById('prompt');
     const $send     = document.getElementById('send');
     const $stats    = document.getElementById('stats');
-    const $tSamOff  = document.getElementById('toggle-sam-off');
-    const $tSamOnly = document.getElementById('toggle-sam-only');
     const ctx = $overlay.getContext('2d');
 
     // Component readiness — gates the prompt UI.
     const components = {
       camera: 'busy',  // 'busy' | 'ok' | 'err'
-      cv:     'busy',
       config: 'busy',
       modal:  'busy',
     };
@@ -160,19 +147,13 @@
       ws:             null,            // WebSocket to Modal tracker
       sessionId:      'sess-' + Math.random().toString(36).slice(2, 10),
       tracking:       false,
-      lastBbox:       null,            // [x, y, w, h] in video pixels
-      template:       null,            // cv.Mat; the ROI we matchTemplate against
-      lastSnap:       0,
-      snapEveryMs:    1000,
-      sentInFlight:   false,           // throttle so we don't queue Modal calls
-      lastSamBbox:    null,            // most recent SAM bbox (persistent in diag)
+      sentInFlight:   false,           // back-pressure: one outstanding track call at a time
+      lastSamBbox:    null,            // most recent SAMURAI bbox
       lastSamAt:      0,
-      lastSeedBbox:   null,            // seed sent to SAM (yellow overlay)
+      lastVisionBbox: null,            // bbox returned by /api/vision (initial seed)
+      lastVisionAt:   0,
       lastDebug:      null,            // debug payload from server
       reconnectTried: false,           // one-shot WS reconnect on drop
-      // Diagnostic toggles ↓
-      samOff:         false,           // skip all SAM track calls
-      samOnly:        false,           // hide local box, stream raw SAM
     };
 
     function setStatus(msg) {
@@ -232,18 +213,7 @@
       }
     }
 
-    // ---------- 2) opencv.js ----------
-    window.Module = {
-      onRuntimeInitialized() {
-        setComponent('cv', 'ok', 'ready');
-      }
-    };
-    // If opencv.js fails to load entirely, mark the component errored.
-    document.getElementById('opencvjs').addEventListener('error', () => {
-      setComponent('cv', 'err', 'failed to load');
-    });
-
-    // ---------- 3) config ----------
+    // ---------- 2) config ----------
     async function loadConfig() {
       setComponent('config', 'busy', 'fetching…');
       try {
@@ -261,7 +231,7 @@
       }
     }
 
-    // ---------- 4) Modal pre-warm ----------
+    // ---------- 3) Modal pre-warm ----------
     // First call after idle takes ~30s while the GPU container cold-boots.
     // Hit /healthz on page load so the server is warm by the time the user submits.
     async function prewarmModal() {
@@ -290,14 +260,13 @@
       }
     }
 
-    // ---------- 5) submit prompt ----------
+    // ---------- 4) submit prompt ----------
     function stopTracking() {
-      // Cleanly tear down the active session so we can start a fresh T1 flow.
+      // Cleanly tear down the active session so we can start a fresh flow.
       state.tracking = false;
       state.sentInFlight = false;
-      state.lastBbox = null;
       state.lastSamBbox = null;
-      if (state.template) { state.template.delete(); state.template = null; }
+      state.lastVisionBbox = null;
       ctx.clearRect(0, 0, $overlay.width, $overlay.height);
       if (state.ws && state.ws.readyState === WebSocket.OPEN) {
         try {
@@ -319,7 +288,7 @@
       }
       $send.disabled = true;
       $prompt.disabled = true;
-      setStatus('asking T1 (Claude Opus) for the target bbox…');
+      setStatus('asking vision (Claude Opus) for the target bbox…');
 
       const frameJpegB64 = grabFrameJpegB64(0.85);
       const W = $video.videoWidth, H = $video.videoHeight;
@@ -331,27 +300,28 @@
         });
         const data = await resp.json();
         if (!resp.ok || !data.bbox) {
-          setStatus('T1 did not return a bbox: ' + (data.reasoning || data.error || JSON.stringify(data)));
+          setStatus('vision did not return a bbox: ' + (data.reasoning || data.error || JSON.stringify(data)));
           maybeEnableUI();
           return;
         }
         const [x1, y1, x2, y2] = data.bbox;
-        const bbox = [
+        const seedBbox = [
           Math.max(0, Math.round(x1)),
           Math.max(0, Math.round(y1)),
           Math.min(W, Math.round(x2)) - Math.max(0, Math.round(x1)),
           Math.min(H, Math.round(y2)) - Math.max(0, Math.round(y1)),
         ];
-        setStatus('T1 → bbox ' + JSON.stringify(bbox) + ' — ' + data.reasoning);
+        setStatus('vision → bbox ' + JSON.stringify(seedBbox) + ' — ' + data.reasoning);
+        state.lastVisionBbox = seedBbox;
+        state.lastVisionAt = performance.now();
         await initSamSession(frameJpegB64, [x1, y1, x2, y2]);
-        seedLocalTracker(bbox);
         state.tracking = true;
         $prompt.value = '';
         // Re-enable the prompt so the user can retarget mid-tracking.
         maybeEnableUI();
         requestAnimationFrame(trackLoop);
       } catch (err) {
-        setStatus('T1 error: ' + err.message);
+        setStatus('vision error: ' + err.message);
         maybeEnableUI();
       }
     }
@@ -359,7 +329,7 @@
     $send.addEventListener('click', onSubmit);
     $prompt.addEventListener('keydown', e => { if (e.key === 'Enter') onSubmit(); });
 
-    // ---------- 6) frame grab ----------
+    // ---------- 5) frame grab ----------
     function grabFrameJpegB64(quality) {
       const c = document.createElement('canvas');
       c.width = $video.videoWidth;
@@ -368,7 +338,7 @@
       return c.toDataURL('image/jpeg', quality).split(',', 2)[1];
     }
 
-    // ---------- 7) Modal websocket ----------
+    // ---------- 6) Modal websocket ----------
     function openSamWs() {
       return new Promise((resolve, reject) => {
         const wsUrl = state.modalUrl.replace(/^http/, 'ws') + '/ws';
@@ -391,69 +361,43 @@
     }
 
     function sendSamTrack() {
-      if (state.samOff) return;
       if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
       if (state.sentInFlight) return;
       const frameJpegB64 = grabFrameJpegB64(0.7);
       state.sentInFlight = true;
-      // In samOnly mode we want to see SAM's natural behavior:
-      //   - omit the browser bbox so SAM uses its own previous output as seed
-      //   - request raw mode so the server skips the output growth clamp
-      const msg = {
-        type: 'track', session_id: state.sessionId, frame: frameJpegB64,
-      };
-      if (state.samOnly) {
-        msg.raw = true;
-        // bbox omitted → server uses its own last_bbox
-      } else {
-        msg.bbox = state.lastBbox || undefined;
-      }
-      state.ws.send(JSON.stringify(msg));
-    }
-
-    function sendStreamFlag(enabled) {
-      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      // bbox omitted → server uses its own last_bbox as seed.
       state.ws.send(JSON.stringify({
-        type: 'stream', session_id: state.sessionId, enabled: !!enabled,
+        type: 'track', session_id: state.sessionId, frame: frameJpegB64, raw: true,
       }));
     }
 
     function onSamMessage(msg) {
       if (msg.type === 'init_ok') {
-        setStatus('SAM 2 session ready. tracking…');
+        setStatus('SAMURAI session ready. tracking…');
         if (msg.debug) { state.lastDebug = msg.debug; renderStats(); }
       } else if (msg.type === 'init_fail') {
-        setStatus('SAM 2 init failed (' + (msg.error || '') + ') — try a different prompt');
+        setStatus('SAMURAI init failed (' + (msg.error || '') + ') — try a different prompt');
         state.tracking = false;
         maybeEnableUI();
-      } else if (msg.type === 'stream_ack') {
-        console.log('[stream] server ack', msg.enabled);
       } else if (msg.type === 'bbox') {
         state.sentInFlight = false;
         if (msg.debug) {
           state.lastDebug = msg.debug;
-          if (msg.debug.seed_bbox) state.lastSeedBbox = msg.debug.seed_bbox;
           renderStats();
         }
         if (msg.bbox) {
           state.lastSamBbox = msg.bbox;
           state.lastSamAt = performance.now();
-          // In samOnly diagnostic mode we deliberately don't snap the local
-          // tracker — we want to see SAM drift on its own without any
-          // browser-side correction muddying the picture.
-          if (!state.samOnly) {
-            seedLocalTracker(msg.bbox);
-          }
         }
       } else if (msg.type === 'error') {
         state.sentInFlight = false;
-        if (msg.error === 'no session' && state.tracking && state.lastBbox) {
-          // Modal restarted and lost our session — re-init from current local bbox.
-          console.warn('SAM session lost, re-initing');
-          const [x, y, w, h] = state.lastBbox;
+        if (msg.error === 'no session' && state.tracking && state.lastSamBbox) {
+          // Modal restarted and lost our session — re-init from current SAMURAI bbox.
+          console.warn('SAMURAI session lost, re-initing');
+          const [x, y, w, h] = state.lastSamBbox;
           initSamSession(grabFrameJpegB64(0.85), [x, y, x + w, y + h]);
         } else {
-          console.warn('SAM ws error', msg);
+          console.warn('SAMURAI ws error', msg);
         }
       }
     }
@@ -465,104 +409,44 @@
       // Auto-reconnect once. If that fails, drop tracking and re-enable the prompt.
       if (state.reconnectTried) {
         state.tracking = false;
-        setStatus('SAM 2 connection lost twice — stopping. Re-submit a prompt to retry.');
+        setStatus('SAMURAI connection lost twice — stopping. Re-submit a prompt to retry.');
         maybeEnableUI();
         return;
       }
       state.reconnectTried = true;
-      setStatus('SAM 2 disconnected — reconnecting…');
+      setStatus('SAMURAI disconnected — reconnecting…');
       try {
         state.ws = await openSamWs();
-        if (state.lastBbox) {
-          const [x, y, w, h] = state.lastBbox;
+        if (state.lastSamBbox) {
+          const [x, y, w, h] = state.lastSamBbox;
           state.ws.send(JSON.stringify({
             type: 'init', session_id: state.sessionId,
             frame: grabFrameJpegB64(0.85), bbox: [x, y, x + w, y + h],
           }));
           // Allow another reconnect later if this connection also drops.
           setTimeout(() => { state.reconnectTried = false; }, 30000);
-          setStatus('SAM 2 reconnected — resuming tracking');
+          setStatus('SAMURAI reconnected — resuming tracking');
         }
       } catch (err) {
         state.tracking = false;
-        setStatus('SAM 2 reconnect failed: ' + err.message);
+        setStatus('SAMURAI reconnect failed: ' + err.message);
         maybeEnableUI();
       }
     }
 
-    // ---------- 8) local tracker (cv.matchTemplate over a search window) ----------
-    function seedLocalTracker(bbox) {
-      const [x, y, w, h] = bbox;
-      if (w <= 4 || h <= 4) return;
-      const c = document.createElement('canvas');
-      c.width = $video.videoWidth; c.height = $video.videoHeight;
-      c.getContext('2d').drawImage($video, 0, 0);
-      const src = cv.imread(c);
-      const roi = src.roi(new cv.Rect(x, y, w, h));
-      const gray = new cv.Mat();
-      cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
-      if (state.template) state.template.delete();
-      state.template = gray;
-      roi.delete();
-      src.delete();
-      state.lastBbox = [x, y, w, h];
-    }
-
-    function trackLocal() {
-      if (!state.template || !state.lastBbox) return;
-      const [lx, ly, lw, lh] = state.lastBbox;
-      const c = document.createElement('canvas');
-      c.width = $video.videoWidth; c.height = $video.videoHeight;
-      c.getContext('2d').drawImage($video, 0, 0);
-      const frame = cv.imread(c);
-      const fg = new cv.Mat();
-      cv.cvtColor(frame, fg, cv.COLOR_RGBA2GRAY);
-      const cx = lx + lw / 2, cy = ly + lh / 2;
-      const sw = Math.min(fg.cols, lw * 3);
-      const sh = Math.min(fg.rows, lh * 3);
-      const sx = Math.max(0, Math.min(fg.cols - sw, Math.round(cx - sw / 2)));
-      const sy = Math.max(0, Math.min(fg.rows - sh, Math.round(cy - sh / 2)));
-      const search = fg.roi(new cv.Rect(sx, sy, sw, sh));
-      const result = new cv.Mat();
-      try {
-        cv.matchTemplate(search, state.template, result, cv.TM_CCOEFF_NORMED);
-        const mm = cv.minMaxLoc(result);
-        const newX = sx + mm.maxLoc.x;
-        const newY = sy + mm.maxLoc.y;
-        state.lastBbox = [newX, newY, lw, lh];
-      } catch (e) {
-        // template may be larger than search if bbox shrunk; skip frame
-      }
-      result.delete(); search.delete(); fg.delete(); frame.delete();
-    }
-
+    // ---------- 7) overlay + stats ----------
     function drawOverlay() {
       ctx.clearRect(0, 0, $overlay.width, $overlay.height);
-      // Local tracker box (red) — hidden in SAM-only diagnostic mode.
-      if (state.lastBbox && !state.samOnly) {
-        const [x, y, w, h] = state.lastBbox;
-        ctx.strokeStyle = '#ff3b30';
+      // SAMURAI box (cyan).
+      if (state.lastSamBbox) {
+        const [x, y, w, h] = state.lastSamBbox;
+        ctx.strokeStyle = '#00aaff';
         ctx.lineWidth = 2;
         ctx.strokeRect(x, y, w, h);
       }
-      // SAM box (cyan). In SAM-only mode, draw persistently and thicker.
-      // Otherwise it's a 250ms flash.
-      if (state.lastSamBbox) {
-        const persistent = state.samOnly;
-        const flashing = !persistent &&
-          performance.now() - state.lastSamAt < 250;
-        if (persistent || flashing) {
-          const [x, y, w, h] = state.lastSamBbox;
-          ctx.strokeStyle = '#00aaff';
-          ctx.lineWidth = persistent ? 2 : 3;
-          ctx.strokeRect(x, y, w, h);
-        }
-      }
-      // Prompt-seed box (yellow, dashed) — only in SAM-only diagnostic mode.
-      // Lets you see at a glance whether SAM is consistently expanding
-      // beyond what it was asked to look at.
-      if (state.samOnly && state.lastSeedBbox) {
-        const [x, y, w, h] = state.lastSeedBbox;
+      // Vision-found seed (yellow, dashed) — fades after 4s; only meaningful at session start.
+      if (state.lastVisionBbox && performance.now() - state.lastVisionAt < 4000) {
+        const [x, y, w, h] = state.lastVisionBbox;
         ctx.strokeStyle = '#f1c40f';
         ctx.lineWidth = 1;
         ctx.setLineDash([6, 4]);
@@ -598,51 +482,17 @@
       ].join('  ');
     }
 
-    // ---------- 9) main loop ----------
-    function trackLoop(t) {
+    // ---------- 8) main loop ----------
+    function trackLoop() {
       if (!state.tracking) return;
-      // Skip the local tracker entirely in SAM-only mode — we want pure SAM
-      // for diagnosis, no template-matching influence on what's overlaid.
-      if (!state.samOnly) trackLocal();
       drawOverlay();
-      // In samOnly mode: send as fast as the previous response returns
-      // (sentInFlight throttle inside sendSamTrack handles back-pressure).
-      const interval = state.samOnly ? 0 : state.snapEveryMs;
-      if (t - state.lastSnap > interval) {
-        state.lastSnap = t;
-        sendSamTrack();
-      }
+      // Send-as-fast-as-possible; sentInFlight back-pressure handles throttling.
+      sendSamTrack();
       requestAnimationFrame(trackLoop);
     }
 
-    // ---------- 10) diagnostic toggles ----------
-    $tSamOff.addEventListener('change', () => {
-      state.samOff = $tSamOff.checked;
-      if (state.samOff && state.samOnly) {
-        // Mutually exclusive — turning SAM off forces SAM-only off.
-        $tSamOnly.checked = false;
-        state.samOnly = false;
-        sendStreamFlag(false);
-      }
-      console.log('[toggle] samOff =', state.samOff);
-    });
-    $tSamOnly.addEventListener('change', () => {
-      state.samOnly = $tSamOnly.checked;
-      if (state.samOnly && state.samOff) {
-        $tSamOff.checked = false;
-        state.samOff = false;
-      }
-      sendStreamFlag(state.samOnly);
-      console.log('[toggle] samOnly =', state.samOnly);
-    });
-    // Make sure we tell the server to stop streaming if the page goes away.
-    window.addEventListener('beforeunload', () => {
-      if (state.samOnly) sendStreamFlag(false);
-    });
-
     // ---------- bootstrap ----------
-    // Camera + opencv.js + config can all start in parallel.
-    // Modal pre-warm waits on config since it needs the URL.
+    // Camera + config can both start in parallel; Modal pre-warm needs the URL.
     startWebcam();
     loadConfig().then(prewarmModal);
     maybeEnableUI();
