@@ -659,7 +659,6 @@
     // ===================================================================
     const HISTORY_LEN = 12;
     const DISTANCE_STABILITY_CM = 5;        // depth change <5cm = stable
-    const STABILITY_CENTER_THRESHOLD = 10;  // 10px center change
     const STABILITY_FRAMES_ARRIVED = 3;
     const DISTANCE_TOL_CM = 8;              // arrived if depth <= target+TOL
     const FOLLOW_BAND_CM = 20;              // follow band around target
@@ -712,47 +711,58 @@
       return true;
     }
 
-    function isCenterStableForFrames(n) {
-      if (state.bboxHistory.length < n) return false;
-      const recent = state.bboxHistory.slice(-n);
-      const baseCx = recent[0].cx;
-      for (const f of recent) {
-        if (Math.abs(f.cx - baseCx) > STABILITY_CENTER_THRESHOLD) return false;
-      }
-      return true;
-    }
-
-    function computeKeystatesAndStatus(bbox, depthCm) {
+function computeKeystatesAndStatus(bbox, depthCm) {
       // Returns { keystates, action, arrived, stuck, depthCm, offset, status }.
+      //
+      // ┌──────────────────────────────────────────────────────────────────┐
+      // │ FLAG — verify with real LaiRA before MVP-on-Pi wireup:           │
+      // │ This composes turn (a/d) + forward (w/s) keystates SIMULTANEOUSLY│
+      // │ when off-center AND not at distance — letting LaiRA walk an arc  │
+      // │ toward the target instead of stopping forward motion every time  │
+      // │ she has to re-center. Quadruped firmware *should* accept w+a or  │
+      // │ w+d in one keystate frame, but I haven't actually confirmed that │
+      // │ on the Pi. If she drops forward motion when a/d is added, fall   │
+      // │ back to sequential (turn-then-walk) — that's the prior behavior. │
+      // └──────────────────────────────────────────────────────────────────┘
       const sess = state.currentSession;
       const W = $video.videoWidth;
       const [x, , w] = bbox;
       const cx = x + w/2;
       const offset = cx - W/2;
       const ks = { w:false, a:false, s:false, d:false, q:false, e:false };
-      let action = 'tracking';
       let arrived = false, stuck = false;
       let status = 'tracking';
 
       const horizDeadzone = W * HORIZ_DEADZONE_FRAC;
       const target = sess.targetDistanceCm;
+      const centered = Math.abs(offset) <= horizDeadzone;
 
-      if (Math.abs(offset) > horizDeadzone) {
-        // Not centered yet — turn first, distance later.
-        if (offset > 0) { ks.d = true; action = 'turning right'; status = 'approach'; }
-        else            { ks.a = true; action = 'turning left';  status = 'approach'; }
-      } else if (sess.mode === 'go_to') {
-        // Centered. Walk forward until depth_cm <= target + tolerance.
+      // Turn (a/d): set whenever off-center, regardless of distance.
+      let turnPart = '';
+      if (!centered) {
+        if (offset > 0) { ks.d = true; turnPart = 'right'; }
+        else            { ks.a = true; turnPart = 'left'; }
+      }
+
+      // Distance (w/s): set forward/back regardless of centering — combined
+      // with turn keystates above, this produces an arc-toward-target motion
+      // instead of stop-turn-walk-stop-turn.
+      let distPart = '';
+      if (sess.mode === 'go_to') {
         if (depthCm == null) {
-          // No depth yet — keep walking conservatively, but we can't decide arrived.
-          ks.w = true; action = 'approaching (no depth)'; status = 'approach';
+          ks.w = true;
+          distPart = 'approaching (no depth)';
+          status = 'approach';
         } else if (depthCm > target + DISTANCE_TOL_CM) {
-          ks.w = true; action = `approaching (Δ=${(depthCm - target).toFixed(0)}cm)`;
+          ks.w = true;
+          distPart = `approaching (Δ=${(depthCm - target).toFixed(0)}cm)`;
           status = 'approach';
         } else {
-          action = 'at distance'; status = 'arrived';
+          distPart = 'at distance';
+          status = centered ? 'arrived' : 'approach';
         }
-        // arrived / stuck only meaningful for go_to.
+
+        // arrived / stuck only meaningful for go_to with depth.
         if (depthCm != null) {
           const now = performance.now();
           // Update best-depth tracker. Initialize on first reading, then
@@ -778,8 +788,9 @@
           }
 
           const distStable = isDistanceStableForFrames(STABILITY_FRAMES_ARRIVED);
-          const centerStable = isCenterStableForFrames(STABILITY_FRAMES_ARRIVED);
-          if (distStable && centerStable && depthCm <= target + DISTANCE_TOL_CM) {
+          // arrived requires we're ALSO centered — otherwise we're at the
+          // right distance but pointing the wrong way.
+          if (distStable && centered && depthCm <= target + DISTANCE_TOL_CM) {
             arrived = true;
           } else if (depthCm > target + DISTANCE_TOL_CM) {
             const elapsed = now - sess.startedAt;
@@ -794,17 +805,28 @@
       } else {
         // follow mode: hold depth within target ± FOLLOW_BAND_CM.
         if (depthCm == null) {
-          action = 'following (no depth)'; status = 'hold';
+          distPart = 'following (no depth)';
+          status = 'hold';
         } else if (depthCm < target - FOLLOW_BAND_CM) {
-          ks.s = true; action = `backing off (Δ=${(target - depthCm).toFixed(0)}cm)`;
+          ks.s = true;
+          distPart = `backing off (Δ=${(target - depthCm).toFixed(0)}cm)`;
           status = 'approach';
         } else if (depthCm > target + FOLLOW_BAND_CM) {
-          ks.w = true; action = `closing (Δ=${(depthCm - target).toFixed(0)}cm)`;
+          ks.w = true;
+          distPart = `closing (Δ=${(depthCm - target).toFixed(0)}cm)`;
           status = 'approach';
         } else {
-          action = 'holding distance'; status = 'hold';
+          distPart = 'holding distance';
+          status = centered ? 'hold' : 'approach';
         }
       }
+
+      // Compose action label
+      let action;
+      if (turnPart && distPart) action = `${distPart} + turn ${turnPart}`;
+      else if (turnPart)         action = `centering: turn ${turnPart}`;
+      else                       action = distPart || 'tracking';
+
       return { keystates: ks, action, arrived, stuck, depthCm, offset, status };
     }
 
@@ -1068,10 +1090,13 @@
         case 'drive': {
           // Opus-only. direction -> keystate map. Cap duration defensively
           // even though server validates schema.
+          // a/d are LaiRA's turn keystates — there's no strafe (quadruped
+          // dogs don't translate sideways). q/e are unused on the Pi side,
+          // so rotate_* MUST map to a/d, not q/e.
           const DIR_MAP = {
             forward: { w: true }, back: { s: true },
             left: { a: true },    right: { d: true },
-            rotate_left:  { q: true }, rotate_right: { e: true },
+            rotate_left:  { a: true }, rotate_right: { d: true },
           };
           const ks = DIR_MAP[args.direction];
           if (!ks) { logConsole('err', `bad direction: ${args.direction}`); runNextStep(); return; }
