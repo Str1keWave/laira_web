@@ -1,7 +1,14 @@
 """
 LaiRA tracker service — Modal serverless GPU.
 
-Architecture (current): SAMURAI on top of SAM 2.1 video predictor.
+Architecture (current): SAMURAI on top of SAM 2.1 video predictor + Depth
+Anything V2 (metric, indoor, small) running on every frame. SAMURAI returns
+the bbox + segmentation mask; the depth model gives a per-pixel metric depth
+map; we sample the median depth under the SAMURAI mask and return depth_cm
+alongside the bbox. The orchestrator uses depth_cm + a per-call
+target_distance_cm to decide when go_to has arrived (replacing the old
+arbitrary done_area_frac heuristic).
+
 Each session maintains a true memory bank — every track call appends the new
 frame to the inference state and runs one propagation step. SAMURAI's
 motion-aware (Kalman-filtered) memory selection picks the most useful prior
@@ -57,6 +64,11 @@ CHECKPOINT_PATH = "/root/checkpoints/sam2.1_hiera_base_plus.pt"
 # SAMURAI ships its own configs that wire the Kalman-augmented memory selection.
 CFG = "configs/samurai/sam2.1_hiera_b+.yaml"
 
+# Depth Anything V2 metric variant. "Indoor" is trained on Hypersim and is
+# the right pick for LaiRA's environment (rooms, ~0.3-5m range). "Small" is
+# ~24M params — ~30ms/frame on L4, comfortably within budget.
+DEPTH_MODEL_NAME = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
+
 # Pruning windows. Sessions are unbounded in length; per-session memory is
 # bounded by these constants instead of by a hard frame cap.
 #
@@ -88,6 +100,7 @@ image = (
         "tqdm",
         "loguru",
         "scipy",        # SAMURAI's Kalman filter imports scipy.linalg
+        "transformers", # Depth Anything V2 metric loader
     )
     .run_commands(
         # SAMURAI is a fork of SAM 2 with Kalman-filtered memory selection.
@@ -98,6 +111,12 @@ image = (
         # we care about right now.
         "cd /opt/samurai-src/sam2 && SAM2_BUILD_CUDA=0 pip install -e .",
         f"mkdir -p /root/checkpoints && wget -q -O {CHECKPOINT_PATH} {CHECKPOINT_URL}",
+        # Pre-download Depth Anything V2 metric weights so the first session
+        # doesn't pay HuggingFace download time during cold start.
+        "python -c \"from transformers import AutoImageProcessor, AutoModelForDepthEstimation; "
+        f"name='{DEPTH_MODEL_NAME}'; "
+        "AutoImageProcessor.from_pretrained(name); "
+        "AutoModelForDepthEstimation.from_pretrained(name)\"",
     )
     # Workdir is the parent of the sam2 package dir so Hydra finds configs and
     # SAM 2's "are you running from inside the package" check doesn't trip.
@@ -110,6 +129,7 @@ with image.imports():
     import torch
     from PIL import Image
     from sam2.build_sam import build_sam2_video_predictor
+    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 
 # ---------- frame preprocessing ----------
@@ -201,6 +221,17 @@ class TrackerService:
         # produced by predictor.init_state(), plus our bookkeeping.
         self.sessions: dict = {}
 
+        # Depth Anything V2 metric, loaded once. fp16 on CUDA — quality is
+        # indistinguishable from fp32 at depth-estimation precision and saves
+        # ~half the inference time. .eval() is important: the model has BN
+        # layers that misbehave in train mode.
+        self.depth_processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL_NAME)
+        self.depth_model = (
+            AutoModelForDepthEstimation
+            .from_pretrained(DEPTH_MODEL_NAME, torch_dtype=torch.float16)
+            .to("cuda").eval()
+        )
+
         # Warmup: exercise the full streaming pipeline once on a dummy frame
         # so the first real session doesn't pay JIT/kernel-compile latency
         # AND so any breakage in the dict-images path fails at boot, not on
@@ -227,7 +258,47 @@ class TrackerService:
                     state, start_frame_idx=1, max_frame_num_to_track=1,
                 )
                 next(gen)
+
+        # Warm depth model on the same dummy frame — JIT/cudnn-autotune happens
+        # here, not on the first user-facing track.
+        try:
+            _ = self._depth_at_mask(dummy, np.ones(dummy.shape[:2], dtype=bool))
+            print("[TrackerService] depth model ready")
+        except Exception as e:
+            print(f"[TrackerService] depth warmup failed: {e!r}")
         print("[TrackerService] SAMURAI ready (streaming path validated)")
+
+    # ---------- depth ----------
+    def _depth_at_mask(self, rgb, mask):
+        """Median metric depth in cm under `mask`, via Depth Anything V2.
+
+        rgb:  (H, W, 3) uint8 RGB image (same array fed to SAM 2).
+        mask: (H, W) bool segmentation mask (typically the SAMURAI output).
+
+        Returns int cm or None if the mask is empty / inference fails.
+        """
+        if mask is None or not mask.any():
+            return None
+        pil = Image.fromarray(rgb)
+        inputs = self.depth_processor(images=pil, return_tensors="pt")
+        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+            outputs = self.depth_model(**inputs)
+        # predicted_depth is (1, H', W') in metres for metric variants.
+        pred = outputs.predicted_depth
+        H, W = rgb.shape[:2]
+        depth_m = torch.nn.functional.interpolate(
+            pred.unsqueeze(1).float(),
+            size=(H, W), mode="bicubic", align_corners=False,
+        ).squeeze(0).squeeze(0).cpu().numpy()  # (H, W) metres
+        masked = depth_m[mask]
+        if masked.size == 0:
+            return None
+        # Median is robust to mask-edge pixels that grab background depth.
+        median_m = float(np.median(masked))
+        if not np.isfinite(median_m) or median_m <= 0:
+            return None
+        return int(round(median_m * 100))
 
     # ---------- helpers ----------
     def _decode(self, b64_jpg: str):
@@ -268,6 +339,13 @@ class TrackerService:
         mask = (masks[0, 0].cpu().numpy() > 0)
         bbox, debug = _mask_to_bbox(mask)
         debug["score"] = None  # add_new_points_or_box doesn't expose iou here
+        # Sample depth on the seed frame too — gives the client an immediate
+        # distance reading instead of waiting for the first track frame.
+        try:
+            debug["depth_cm"] = self._depth_at_mask(first_rgb, mask)
+        except Exception as e:
+            print(f"[init] depth EXC sid={sid}: {e!r}")
+            debug["depth_cm"] = None
         if bbox is None:
             return None, debug
 
@@ -359,6 +437,14 @@ class TrackerService:
 
         mask = (video_res_masks[0, 0].cpu().numpy() > 0)
         bbox, debug = _mask_to_bbox(mask)
+
+        # Per-frame depth sample under the SAMURAI mask. This is the value the
+        # T1 orchestrator uses to decide go_to "arrived" vs follow-band-keep.
+        try:
+            debug["depth_cm"] = self._depth_at_mask(rgb, mask)
+        except Exception as e:
+            print(f"[track] depth EXC sid={sid}: {e!r}")
+            debug["depth_cm"] = None
 
         # Pull SAMURAI's iou + kalman scores out of the most recent
         # non-cond output (they live on the last frame's compact_current_out).

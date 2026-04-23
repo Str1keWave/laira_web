@@ -25,17 +25,17 @@ app.get('/api/config', (req, res) => {
 });
 
 // =============================================================
-// /api/vision — single-shot vision lookup. Given a frame + a target description
-// + a purpose, return a bbox that fully contains the target and (for go_to) an
-// estimate of what fraction of the frame the target should occupy when LaiRA
-// has "arrived" next to it.
+// /api/vision — single-shot vision lookup. Given a frame + a target description,
+// return a bbox that fully contains the target.
+//
+// Distance-to-arrival is no longer the LLM's job — the SAMURAI worker on Modal
+// runs Depth Anything V2 alongside SAM 2 and emits a metric depth_cm per frame.
+// The orchestrator decides the target distance per intent (target_distance_cm
+// argument on follow / go_to). All this endpoint owes the caller is the bbox.
 //
 // Used by:
-//   - stream_test.html (pre-T1: just needs bbox to seed SAMURAI)
+//   - stream_test.html (just needs bbox to seed SAMURAI)
 //   - the T1 orchestrator (when executing follow / go_to tools)
-//
-// Was /api/t1 in earlier iterations. Renamed because /api/t1 now belongs to
-// the orchestrator endpoint below.
 // =============================================================
 app.post('/api/vision', async (req, res) => {
   try {
@@ -48,30 +48,16 @@ app.post('/api/vision', async (req, res) => {
       return res.status(500).json({ error: 'T1_PROMPT_KEY not set on server' });
     }
 
-    // done_area_frac is the LLM's world-knowledge estimate of "how much of
-    // the frame should this target occupy when LaiRA is right next to it."
-    // It feeds the arrived-detector for go_to. We always ask for it (even
-    // for follow / identify) since it's cheap and lets the caller reuse
-    // the same vision call across modes.
     const systemPrompt = [
       "You are LaiRA's vision module. You receive a single video frame and a target",
       "description. Identify the target and return a single JSON object — no",
       "surrounding text — of the form:",
-      '  {"bbox": [x1, y1, x2, y2], "done_area_frac": 0.XX, "reasoning": "brief"}',
+      '  {"bbox": [x1, y1, x2, y2], "reasoning": "brief"}',
       `Coordinates are integer pixels in the image's native resolution (image width=${width || 'unknown'}, height=${height || 'unknown'}).`,
       "The bbox should fully contain the target with a small margin (~10px).",
       "",
-      "done_area_frac is YOUR ESTIMATE of what fraction of the frame the target",
-      "should occupy when LaiRA (a small quadruped robot dog with a forward-facing",
-      "camera ~30cm above the ground) has walked right up to it. Calibration:",
-      "  - tennis ball / mug / small toy:        ~0.05 - 0.10",
-      "  - a chair, a backpack, a small box:     ~0.20 - 0.30",
-      "  - a person standing:                    ~0.35 - 0.50",
-      "  - a sofa or large object she'd nose:    ~0.40 - 0.60",
-      "Use 0.30 as a fallback if you're unsure.",
-      "",
       "If you cannot identify the target with confidence, return:",
-      '  {"bbox": null, "done_area_frac": null, "reasoning": "why not"}',
+      '  {"bbox": null, "reasoning": "why not"}',
       "",
       `Caller's purpose: ${purpose || 'unspecified'}.`,
     ].join('\n');
@@ -110,11 +96,6 @@ app.post('/api/vision', async (req, res) => {
       return res.status(502).json({ error: 'no_json_in_response', raw: text });
     }
     const parsed = JSON.parse(m[0]);
-    // Backfill default done_area_frac if missing or invalid — we promised the
-    // caller this field always has a usable number for non-null bboxes.
-    if (parsed.bbox && (parsed.done_area_frac == null || isNaN(parsed.done_area_frac))) {
-      parsed.done_area_frac = 0.30;
-    }
     return res.json(parsed);
   } catch (err) {
     console.error('/api/vision error', err);
@@ -166,13 +147,17 @@ const SHARED_TOOLS = [
   },
   {
     name: 'follow',
-    description: 'Continuously track and follow a target object until told to stop. Holds a comfortable following distance, does NOT terminate on its own. Use for: follow X, chase X, stay on X. For "follow me" the target is the visible person.',
+    description: 'Continuously track and follow a target object until told to stop. Holds the requested following distance, does NOT terminate on its own. Use for: follow X, chase X, stay on X. For "follow me" the target is the visible person.',
     input_schema: {
       type: 'object',
       properties: {
         target: { type: 'string', description: 'Short natural-language description of what to follow (e.g. "the person in the red shirt", "me", "the green ball").' },
+        target_distance_cm: {
+          type: 'integer', minimum: 5, maximum: 300,
+          description: 'How far back LaiRA should hold while following, in centimetres. Reference points: 30-50 close-follow on a small toy or pet, 60-100 a polite person-following distance, 150+ "stay in the area but give space".',
+        },
       },
-      required: ['target'],
+      required: ['target', 'target_distance_cm'],
     },
   },
   {
@@ -182,8 +167,12 @@ const SHARED_TOOLS = [
       type: 'object',
       properties: {
         target: { type: 'string', description: 'Short natural-language description of what to walk to.' },
+        target_distance_cm: {
+          type: 'integer', minimum: 5, maximum: 300,
+          description: 'How close LaiRA should be to the target when "arrived", in centimetres. Reference points: 10-20 nose-to-target (a ball she\'d sniff), 30-60 body-distance (a person, another dog, a piece of furniture she greets), 80-150 room-scale ("just be in the area").',
+        },
       },
-      required: ['target'],
+      required: ['target', 'target_distance_cm'],
     },
   },
   {
@@ -237,7 +226,8 @@ const SONNET_SYSTEM = [
   '',
   'You are the first-line command router for LaiRA. Your job: decide which single tool to call.',
   'You have a small set of safe actions. For anything compound, fine-grained-movement-related, or uncertain, call escalate(). It is ALWAYS better to escalate than to guess.',
-  'Vision tools (follow, go_to) accept a natural-language target description. Pass the user\'s wording through — don\'t identify the target yourself, the vision system will handle it.',
+  'STOP/CANCEL is NOT one of the cases that needs escalation. If the user says "stop", "halt", "freeze", "never mind", "cancel that", or anything in that family, call stop() directly. Never escalate a stop intent — escalation adds latency and stop should be instant.',
+  'Vision tools (follow, go_to) accept a natural-language target description AND a target_distance_cm — how close LaiRA should be to the target. Pass the user\'s wording through for the target. For target_distance_cm, infer from the user\'s intent what makes sense (sniff/touch a ball ≈ 15cm; greet a person ≈ 50cm; "just be in the kitchen" ≈ 150cm). When in genuine doubt about distance, escalate.',
   'You see the current camera frame so you can sanity-check whether a tool makes sense (e.g. don\'t call follow("the cat") if there\'s clearly no cat). But don\'t over-interpret — the vision system is more capable than you at object identification.',
   'Always emit exactly one tool call. Never zero, never multiple.',
 ].join('\n');
@@ -247,7 +237,8 @@ const OPUS_SYSTEM = [
   '',
   'You are the orchestrator for LaiRA. You were called because the request was too complex for the first-line router. Plan the entire sequence of tool calls UPFRONT in one response. You will NOT get a chance to react to results — tools execute fire-and-forget, and any failure aborts the rest of the plan.',
   'Be conservative. If a step is risky or you\'re uncertain it will work, omit it. Better to do less correctly than more half-done.',
-  'You can issue multiple tool calls in your single response. They execute in order. Each tool blocks until complete (e.g. go_to() blocks until LaiRA arrives or gives up). Plan accordingly: after a successful go_to(green ball), you can chain a sit() because you know LaiRA will be standing next to it.',
+  'You can issue multiple tool calls in your single response. They execute in order. Each tool blocks until complete (e.g. go_to() blocks until LaiRA arrives or gives up). Plan accordingly: after a successful go_to(green ball, 15), you can chain a sit() because you know LaiRA will be standing right next to it.',
+  'For follow / go_to you must pick target_distance_cm (5-300). Reference: 10-20 nose-to-target, 30-60 body-distance to a person/dog, 80-150 room-scale. Choose what fits the user\'s actual intent.',
   'You have a drive() tool the first-line router does not. Use it for "turn around", "back up", "explore" type intents.',
 ].join('\n');
 

@@ -37,14 +37,17 @@
     2. Single-shot plans from Opus. No multi-turn reactivity for MVP. If a
        step fails, the rest of the plan aborts and the failure is logged.
 
-    3. arrived(go_to) = centered AND area >= done_area_frac AND stable_for_3.
-       stuck   (go_to) = stable_for_10 AND area < done_area_frac.
+    3. arrived(go_to) = centered AND depth_cm <= target_distance_cm + TOL
+       AND depth-stable for 3 frames.
+       stuck   (go_to) = depth-stable for 10 frames AND depth_cm still above target.
        lost   (either) = null bbox for >2s consecutive (~20 frames).
-       Stability check is essential: it prevents false-arrived from
-       Opus's done_area_frac estimate being too low.
+       Distance comes from SAMURAI worker's Depth Anything V2 pass — sampled
+       as the median depth under the SAMURAI mask. target_distance_cm is
+       chosen by the LLM per-call (Sonnet/Opus picks 15cm to sniff a ball,
+       60cm to greet a person, etc).
 
-    4. follow() never terminates by itself. Holds a target distance =
-       0.5 * done_area_frac. Only ends on cancellation.
+    4. follow() never terminates by itself. Holds depth_cm within
+       target_distance_cm ± FOLLOW_BAND_CM. Only ends on cancellation.
 
     5. Manual input ALWAYS cancels active T1 session before executing.
        Mirrors user.html semantics.
@@ -54,17 +57,21 @@
        responses are dropped silently.
 
     Critical assumptions to re-examine if behavior is wrong:
-      - Bbox area is a usable distance proxy. (Holds for ONE target with
-        consistent appearance. Falls apart if the target's apparent size
-        is being warped by occlusion or pose change.)
-      - Opus's done_area_frac estimate is in the right ballpark. (Shaky.
-        Mitigation: stuck-detection halts indefinitely-unreachable goals
-        rather than trying to march into them forever.)
-      - The horizontal deadzone (15.6% of width) and stability deltas
-        (5% area, 10px center) are tuned for ~10fps SAMURAI throughput.
-        If the rate changes substantially these need to be refit.
+      - Depth Anything V2 (indoor metric small) is accurate enough at 0.3-3m.
+        If it overshoots/undershoots systematically, can apply a calibration
+        scalar before comparing to target_distance_cm.
+      - Sampling depth as the median under the full SAMURAI mask is robust
+        to outliers (the boundary always grabs some background). If the
+        target is occluded by something nearer, median can still skew
+        toward the occluder; consider trimmed-mean if that bites.
+      - The horizontal deadzone (15.6% of width) and stability thresholds
+        (5cm depth, 10px center, 3/10 frames) are tuned for ~10fps SAMURAI
+        throughput. If the rate changes substantially these need to be refit.
       - SAMURAI's auto-reset is good enough that we don't need our own
         loss-recovery in MVP. Confirmed by user testing on stream_test.
+      - depth_cm is null until the worker has been redeployed with the
+        Depth Anything pass. While null, arrived/stuck won't fire and
+        go_to will only end on cancellation — degraded but not broken.
 
     =========================================================================
   -->
@@ -118,6 +125,19 @@
     }
     .sw { display: inline-block; width: 10px; height: 10px;
       vertical-align: middle; margin-right: 4px; }
+
+    /* Tracker stats — distance, target, status, kf warmup */
+    #tracker-stats {
+      width: min(900px, 92vw); margin: 4px auto 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; color: #888;
+      min-height: 14px; text-align: center;
+    }
+    #tracker-stats .arrived  { color: #a5d6a7; font-weight: 600; }
+    #tracker-stats .stuck    { color: #ff8a80; font-weight: 600; }
+    #tracker-stats .lost     { color: #ff8a80; }
+    #tracker-stats .approach { color: #b8c0ff; }
+    #tracker-stats .hold     { color: #2ecc71; }
 
     /* T1 reasoning console */
     #console {
@@ -208,6 +228,8 @@
     </div>
   </div>
 
+  <div id="tracker-stats"></div>
+
   <div id="console"></div>
 
   <div id="commandBar">
@@ -237,6 +259,7 @@
     const $wouldRows= document.getElementById('would-send-rows');
     const $t1State  = document.getElementById('t1-state');
     const $t1Action = document.getElementById('t1-action');
+    const $stats    = document.getElementById('tracker-stats');
     const ctx       = $overlay.getContext('2d');
 
     const components = { camera: 'busy', config: 'busy', modal: 'busy', t1: 'busy' };
@@ -249,11 +272,12 @@
       currentSession: null,            // { id, mode, target, doneAreaFrac, ... }
       t1State: 'IDLE',                 // IDLE | PLANNING | EXECUTING | TRACKING
       lastSamBbox: null,
+      lastDepthCm: null,               // most recent depth_cm from worker
       lastVisionBbox: null,
       lastVisionAt: 0,
       sentInFlight: false,             // SAMURAI WS back-pressure
-      // Sliding history for arrived/stuck detection — recent bbox stats.
-      bboxHistory: [],                 // [{frame_w, frame_h, x, y, w, h, t}]
+      // Sliding history for arrived/stuck detection — recent bbox+depth stats.
+      bboxHistory: [],                 // [{x, y, w, h, cx, depthCm, t}]
     };
 
     function setComponent(name, status, label) {
@@ -518,7 +542,12 @@
       } else if (msg.type === 'bbox') {
         state.sentInFlight = false;
         state.lastSamBbox = msg.bbox;
-        if (msg.bbox) onBboxArrived(msg.bbox);
+        // depth_cm rides in debug payload (worker writes it after sampling
+        // Depth Anything V2 under the SAMURAI mask). May be null if the
+        // worker hasn't been redeployed with depth, or if the model failed.
+        const depthCm = (msg.debug && msg.debug.depth_cm != null) ? msg.debug.depth_cm : null;
+        state.lastDepthCm = depthCm;
+        if (msg.bbox) onBboxArrived(msg.bbox, depthCm);
         else onBboxLost();
       } else if (msg.type === 'error') {
         state.sentInFlight = false;
@@ -600,93 +629,153 @@
     //   horizontalDeadzone=100/640). Outside deadzone -> turn keystate.
     // Inside deadzone -> distance-based forward/back keystate.
     //
-    // For go_to: walk forward until area_frac >= done_area_frac.
-    // For follow: hold target distance = 0.5 * done_area_frac (we follow
-    //   from further away than we go-to).
+    // Distance is metric (cm) from the SAMURAI worker's depth pass. The
+    // LLM picks target_distance_cm per call (e.g. 15 to sniff a ball, 60
+    // to greet a person). We compare physical depth to physical target.
     //
-    // History buffer tracks last ~12 frames (~1.2s @ 10fps) of bbox stats
-    // so we can compute stability without depending on absolute frame index.
+    // For go_to: walk forward until depth_cm <= target + DISTANCE_TOL_CM.
+    //   "arrived" requires depth-stable for 3 frames so we don't misfire
+    //   on a single noisy reading.
+    // For follow: hold depth_cm within target ± FOLLOW_BAND_CM.
+    //
+    // depth_cm absent (worker not yet redeployed with depth model, or
+    // model failed): we still center but never declare arrived/stuck.
+    //
+    // History buffer tracks last ~12 frames (~1.2s @ 10fps) of bbox+depth
+    // stats so we can compute stability without depending on absolute frame index.
     // ===================================================================
     const HISTORY_LEN = 12;
-    const STABILITY_AREA_THRESHOLD = 0.05;  // 5% relative area change
+    const DISTANCE_STABILITY_CM = 5;        // depth change <5cm = stable
     const STABILITY_CENTER_THRESHOLD = 10;  // 10px center change
     const STABILITY_FRAMES_ARRIVED = 3;
     const STABILITY_FRAMES_STUCK = 10;
+    const DISTANCE_TOL_CM = 8;              // arrived if depth <= target+TOL
+    const FOLLOW_BAND_CM = 20;              // follow band around target
     const LOST_GRACE_MS = 2000;
     const HORIZ_DEADZONE_FRAC = 0.156;
 
-    function pushBboxHistory(bbox) {
-      const W = $video.videoWidth, H = $video.videoHeight;
+    function pushBboxHistory(bbox, depthCm) {
       const [x, y, w, h] = bbox;
-      state.bboxHistory.push({ x, y, w, h, cx: x + w/2, area: w*h, t: performance.now() });
+      state.bboxHistory.push({
+        x, y, w, h,
+        cx: x + w/2,
+        depthCm: (depthCm == null ? null : depthCm),
+        t: performance.now(),
+      });
       while (state.bboxHistory.length > HISTORY_LEN) state.bboxHistory.shift();
     }
 
-    function isStableForFrames(n) {
-      // Relative area change AND absolute center change both stay under
-      // threshold for the most recent n frames.
+    function isDistanceStableForFrames(n) {
+      // Most recent n frames: every depth reading is non-null AND no two
+      // frames differ by more than DISTANCE_STABILITY_CM.
       if (state.bboxHistory.length < n) return false;
       const recent = state.bboxHistory.slice(-n);
-      const baseArea = recent[0].area;
+      if (recent.some(f => f.depthCm == null)) return false;
+      const base = recent[0].depthCm;
+      for (const f of recent) {
+        if (Math.abs(f.depthCm - base) > DISTANCE_STABILITY_CM) return false;
+      }
+      return true;
+    }
+
+    function isCenterStableForFrames(n) {
+      if (state.bboxHistory.length < n) return false;
+      const recent = state.bboxHistory.slice(-n);
       const baseCx = recent[0].cx;
       for (const f of recent) {
-        if (Math.abs(f.area - baseArea) / Math.max(baseArea, 1) > STABILITY_AREA_THRESHOLD) return false;
         if (Math.abs(f.cx - baseCx) > STABILITY_CENTER_THRESHOLD) return false;
       }
       return true;
     }
 
-    function computeKeystatesAndStatus(bbox) {
-      // Returns { keystates, action, arrived, stuck }.
+    function computeKeystatesAndStatus(bbox, depthCm) {
+      // Returns { keystates, action, arrived, stuck, depthCm, offset, status }.
       const sess = state.currentSession;
-      const W = $video.videoWidth, H = $video.videoHeight;
-      const [x, y, w, h] = bbox;
+      const W = $video.videoWidth;
+      const [x, , w] = bbox;
       const cx = x + w/2;
       const offset = cx - W/2;
-      const areaFrac = (w * h) / (W * H);
       const ks = { w:false, a:false, s:false, d:false, q:false, e:false };
       let action = 'tracking';
       let arrived = false, stuck = false;
+      let status = 'tracking';
 
       const horizDeadzone = W * HORIZ_DEADZONE_FRAC;
+      const target = sess.targetDistanceCm;
 
       if (Math.abs(offset) > horizDeadzone) {
         // Not centered yet — turn first, distance later.
-        if (offset > 0) { ks.d = true; action = 'turning right'; }
-        else            { ks.a = true; action = 'turning left'; }
+        if (offset > 0) { ks.d = true; action = 'turning right'; status = 'approach'; }
+        else            { ks.a = true; action = 'turning left';  status = 'approach'; }
       } else if (sess.mode === 'go_to') {
-        // Centered. Walk forward until we hit done_area_frac.
-        if (areaFrac < sess.doneAreaFrac) {
-          ks.w = true; action = 'approaching';
+        // Centered. Walk forward until depth_cm <= target + tolerance.
+        if (depthCm == null) {
+          // No depth yet — keep walking conservatively, but we can't decide arrived.
+          ks.w = true; action = 'approaching (no depth)'; status = 'approach';
+        } else if (depthCm > target + DISTANCE_TOL_CM) {
+          ks.w = true; action = `approaching (Δ=${(depthCm - target).toFixed(0)}cm)`;
+          status = 'approach';
         } else {
-          action = 'centered, at distance';
+          action = 'at distance'; status = 'arrived';
         }
-        // Arrived / stuck only meaningful for go_to.
-        const stableArrived = isStableForFrames(STABILITY_FRAMES_ARRIVED);
-        const stableStuck   = isStableForFrames(STABILITY_FRAMES_STUCK);
-        if (stableArrived && areaFrac >= sess.doneAreaFrac) arrived = true;
-        else if (stableStuck && areaFrac < sess.doneAreaFrac) stuck = true;
+        // arrived / stuck only meaningful for go_to.
+        if (depthCm != null) {
+          const distStable = isDistanceStableForFrames(STABILITY_FRAMES_ARRIVED);
+          const distStableLong = isDistanceStableForFrames(STABILITY_FRAMES_STUCK);
+          const centerStable = isCenterStableForFrames(STABILITY_FRAMES_ARRIVED);
+          if (distStable && centerStable && depthCm <= target + DISTANCE_TOL_CM) {
+            arrived = true;
+          } else if (distStableLong && depthCm > target + DISTANCE_TOL_CM) {
+            stuck = true;
+          }
+        }
       } else {
-        // follow mode: hold half the done size as a comfortable distance.
-        const targetFrac = sess.doneAreaFrac * 0.5;
-        const band = 0.05;
-        if (areaFrac < targetFrac - band)      { ks.w = true; action = 'closing distance'; }
-        else if (areaFrac > targetFrac + band) { ks.s = true; action = 'backing off'; }
-        else                                    { action = 'holding distance'; }
+        // follow mode: hold depth within target ± FOLLOW_BAND_CM.
+        if (depthCm == null) {
+          action = 'following (no depth)'; status = 'hold';
+        } else if (depthCm < target - FOLLOW_BAND_CM) {
+          ks.s = true; action = `backing off (Δ=${(target - depthCm).toFixed(0)}cm)`;
+          status = 'approach';
+        } else if (depthCm > target + FOLLOW_BAND_CM) {
+          ks.w = true; action = `closing (Δ=${(depthCm - target).toFixed(0)}cm)`;
+          status = 'approach';
+        } else {
+          action = 'holding distance'; status = 'hold';
+        }
       }
-      return { keystates: ks, action, arrived, stuck, areaFrac, offset };
+      return { keystates: ks, action, arrived, stuck, depthCm, offset, status };
+    }
+
+    function renderTrackerStats(info) {
+      // info = { depthCm, target, mode, action, status } or null to clear.
+      if (!info) { $stats.textContent = ''; return; }
+      const dist = info.depthCm == null ? '—' : `${info.depthCm}cm`;
+      const tgt  = info.target == null ? '—' : `${info.target}cm`;
+      const delta = (info.depthCm != null && info.target != null)
+        ? `Δ=${(info.depthCm - info.target).toFixed(0)}cm` : 'Δ=—';
+      const cls = ({
+        arrived: 'arrived', stuck: 'stuck', lost: 'lost',
+        approach: 'approach', hold: 'hold',
+      })[info.status] || '';
+      $stats.innerHTML = `mode=${info.mode}  dist=${dist}  target=${tgt}  ${delta}  ` +
+        `<span class="${cls}">[${info.action}]</span>`;
     }
 
     let lastTrackingKeystateSig = '';
 
-    function onBboxArrived(bbox) {
+    function onBboxArrived(bbox, depthCm) {
       const sess = state.currentSession;
       if (!sess) return;
-      pushBboxHistory(bbox);
+      pushBboxHistory(bbox, depthCm);
       // Reset lost timer.
       sess.lastBboxAt = performance.now();
-      const { keystates, action, arrived, stuck, areaFrac, offset } = computeKeystatesAndStatus(bbox);
+      const info = computeKeystatesAndStatus(bbox, depthCm);
+      const { keystates, action, arrived, stuck } = info;
       setT1State('TRACKING', `${sess.mode}: ${sess.target} — ${action}`);
+      renderTrackerStats({
+        mode: sess.mode, target: sess.targetDistanceCm,
+        depthCm, action, status: info.status,
+      });
       // Throttle would-send: only emit when keystates actually change. The
       // Pi doesn't need 10Hz of identical messages; user.html sends every
       // animation frame but the redundant ones are noise here.
@@ -696,10 +785,10 @@
         executeKeystate(keystates);
       }
       if (arrived) {
-        logConsole('ok', `arrived at "${sess.target}" (areaFrac=${areaFrac.toFixed(3)} >= ${sess.doneAreaFrac.toFixed(3)})`);
+        logConsole('ok', `arrived at "${sess.target}" (depth=${depthCm}cm <= target=${sess.targetDistanceCm}cm + ${DISTANCE_TOL_CM}cm tol)`);
         finishSession('arrived');
       } else if (stuck) {
-        logConsole('err', `stuck approaching "${sess.target}" (areaFrac=${areaFrac.toFixed(3)} stable below ${sess.doneAreaFrac.toFixed(3)})`);
+        logConsole('err', `stuck approaching "${sess.target}" (depth=${depthCm}cm stable above target=${sess.targetDistanceCm}cm)`);
         finishSession('stuck');
       }
     }
@@ -709,6 +798,10 @@
       // momentary occlusion, not a true loss.
       const sess = state.currentSession; if (!sess) return;
       const sinceLast = performance.now() - (sess.lastBboxAt || sess.startedAt);
+      renderTrackerStats({
+        mode: sess.mode, target: sess.targetDistanceCm,
+        depthCm: null, action: `lost (${Math.round(sinceLast)}ms)`, status: 'lost',
+      });
       if (sinceLast > LOST_GRACE_MS) {
         logConsole('err', `lost "${sess.target}" (no bbox for ${Math.round(sinceLast)}ms)`);
         finishSession('lost');
@@ -757,12 +850,14 @@
       stopSamuraiSession();
       state.currentSession = null;
       state.lastSamBbox = null;
+      state.lastDepthCm = null;
       state.lastVisionBbox = null;
       state.bboxHistory = [];
       lastTrackingKeystateSig = '';
       // Emit a final keystate-zero to mirror user.html's "stop on cancel".
       executeKeystate({});
       setT1State('IDLE');
+      renderTrackerStats(null);
       ctx.clearRect(0, 0, $overlay.width, $overlay.height);
     }
 
@@ -771,9 +866,11 @@
       stopSamuraiSession();
       state.currentSession = null;
       state.lastSamBbox = null;
+      state.lastDepthCm = null;
       state.bboxHistory = [];
       lastTrackingKeystateSig = '';
       executeKeystate({});
+      renderTrackerStats(null);
       // Kick the plan forward.
       runNextStep();
     }
@@ -837,9 +934,16 @@
         }
 
         case 'follow':
-        case 'go_to':
-          startVisionThenTrack(tool, args.target);
+        case 'go_to': {
+          const distCm = args.target_distance_cm;
+          if (typeof distCm !== 'number' || distCm < 5 || distCm > 300) {
+            logConsole('err', `${tool}: invalid target_distance_cm (${distCm})`);
+            runNextStep();
+            return;
+          }
+          startVisionThenTrack(tool, args.target, distCm);
           break;
+        }
 
         default:
           logConsole('err', `unknown tool: ${tool}`);
@@ -847,9 +951,9 @@
       }
     }
 
-    async function startVisionThenTrack(mode, target) {
+    async function startVisionThenTrack(mode, target, targetDistanceCm) {
       const planSid = state.sessionId;
-      setT1State('EXECUTING', `${mode}: ${target} (vision lookup)`);
+      setT1State('EXECUTING', `${mode}: ${target} @${targetDistanceCm}cm (vision lookup)`);
       let visionResult;
       try {
         visionResult = await callVision(target, mode);
@@ -864,7 +968,7 @@
         runNextStep();
         return;
       }
-      logConsole('t1', `vision: ${visionResult.reasoning || ''} done_area_frac=${visionResult.done_area_frac}`);
+      logConsole('t1', `vision: ${visionResult.reasoning || ''}`);
       const [x1, y1, x2, y2] = visionResult.bbox;
       const initBbox = [x1, y1, x2 - x1, y2 - y1];
       state.lastVisionBbox = initBbox;
@@ -873,10 +977,14 @@
         id: planSid,
         mode,
         target,
-        doneAreaFrac: visionResult.done_area_frac || 0.30,
+        targetDistanceCm,
         startedAt: performance.now(),
       };
-      setT1State('EXECUTING', `${mode}: ${target} (opening SAMURAI)`);
+      renderTrackerStats({
+        mode, target: targetDistanceCm, depthCm: null,
+        action: 'opening SAMURAI', status: 'approach',
+      });
+      setT1State('EXECUTING', `${mode}: ${target} @${targetDistanceCm}cm (opening SAMURAI)`);
       try {
         await startSamuraiSession(initBbox);
       } catch (err) {
