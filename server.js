@@ -17,6 +17,24 @@ app.get('/t1_test', (req, res) => {
   res.sendFile(__dirname + '/public/t1_test.html');
 });
 
+// === /smart_laira_test — combined /user + /t1_test. Receives LaiRA's onboard
+// camera over WebRTC (same handshake as /user) and uses that feed as the
+// vision input for the T1 orchestrator. All keystates, pose payloads, and
+// custom angle/action sequences are sent over the same /user WebSocket the
+// /user page uses, so the orchestrator actually drives the real Pi instead
+// of just logging "would-send". STT messages forwarded from LaiRA's mic are
+// piped into the orchestrator on a wake word — no separate audio pipeline
+// in the browser.
+//
+// /user vs /smart_laira_test: /user is dumb-WASD + small button-set + local
+// cocossd AI Follow. /smart_laira_test is the smart brain — Sonnet/Opus
+// routing, SAMURAI tracking, distance-aware go_to/follow, multi-step plans.
+// They share the WebSocket endpoint (/user) and the WebRTC handshake, so
+// LaiRA-side code is unchanged.
+app.get('/smart_laira_test', (req, res) => {
+  res.sendFile(__dirname + '/public/smart_laira_test.html');
+});
+
 // Browser asks for the runtime config (Modal tracker URL, etc.) on page load.
 app.get('/api/config', (req, res) => {
   res.json({

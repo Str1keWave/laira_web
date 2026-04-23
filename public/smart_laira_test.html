@@ -1,0 +1,1282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>LaiRA Smart Test — T1 orchestrator on real Pi</title>
+  <!--
+    =========================================================================
+    /smart_laira_test — combined /user + /t1_test.
+
+    Difference from /t1_test:
+      - Vision input is LaiRA's onboard camera over WebRTC (NOT browser webcam).
+      - All keystates / pose angles / action commands are SENT to the real Pi
+        over the /user WebSocket, not logged as "would-send".
+      - STT messages forwarded from LaiRA's mic ([STT] chat-messages) are piped
+        into the T1 orchestrator on a wake word.
+
+    Difference from /user:
+      - No on-page WASD steering brain — the orchestrator drives. Manual WASD
+        is still wired as a fallback override (and as a cancel for active T1).
+      - No local cocossd AI Follow — replaced by SAMURAI follow/go_to via T1.
+
+    The two pages share the same WebSocket endpoint (/user) and the same
+    WebRTC handshake, so LaiRA-side code requires no changes. You can have
+    /user and /smart_laira_test open simultaneously; they'll fight over
+    keystate timing, so don't do that during a real test.
+    =========================================================================
+  -->
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    html, body { height: 100%; background: #121212; color: #e0e0e0; }
+    body { display: flex; flex-direction: column; align-items: center; }
+
+    h2 { margin: 12px 0 4px; font-size: 16px; color: #aaa; font-weight: 500; }
+    h2 .badge { background: #4f46e5; color: white; padding: 2px 8px;
+      border-radius: 4px; font-size: 11px; margin-left: 8px; vertical-align: middle; }
+
+    /* Component status bar */
+    #status-list {
+      display: grid; grid-template-columns: auto auto auto auto auto;
+      gap: 4px 14px; margin: 6px 0; font-size: 12px; color: #aaa;
+    }
+    #status-list .label { text-align: right; }
+    #status-list .value { display: flex; align-items: center; gap: 6px; }
+    #status-list .dot { display: inline-block; width: 9px; height: 9px;
+      border-radius: 50%; background: #555; }
+    .dot.ok   { background: #2ecc71; }
+    .dot.busy { background: #f1c40f; animation: pulse 1.4s infinite; }
+    .dot.err  { background: #e74c3c; }
+    @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.35 } }
+
+    #t1-state-row { margin: 8px 0 4px; font-size: 13px; display: flex; gap: 10px; align-items: center; }
+    #t1-state { font-weight: 700; padding: 2px 8px; border-radius: 4px; background: #333; }
+    #t1-state.IDLE      { background: #333; color: #aaa; }
+    #t1-state.PLANNING  { background: #f1c40f; color: #000; }
+    #t1-state.EXECUTING { background: #2980b9; color: #fff; }
+    #t1-state.TRACKING  { background: #27ae60; color: #fff; }
+
+    /* Video stage */
+    #stage { position: relative; max-width: 100vw; margin-top: 4px; }
+    #video, #overlay { display: block; max-width: 100%; max-height: 55vh; }
+    #overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+
+    #video {
+      background: #000;
+      object-fit: contain;
+    }
+
+    /* "Sent to Pi" green overlay log — top-left of the video */
+    #sent-log {
+      position: absolute; top: 8px; left: 8px;
+      background: rgba(0,0,0,0.55); padding: 6px 10px; border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; line-height: 1.4; color: #2ecc71;
+      max-width: 60%; max-height: 40%; overflow-y: auto;
+      pointer-events: auto;
+    }
+    #sent-log .head { color: #6efa9b; font-weight: 600; margin-bottom: 4px; }
+    #sent-log .row  { color: #2ecc71; }
+    #sent-log .row .ts { color: #5b8a6b; margin-right: 4px; }
+
+    /* SAMURAI legend — top-right */
+    #legend {
+      position: absolute; top: 8px; right: 8px;
+      background: rgba(0,0,0,0.55); padding: 6px 10px; border-radius: 4px;
+      font-size: 11px; color: #ccc;
+    }
+    #legend .sw { display: inline-block; width: 12px; height: 12px;
+      vertical-align: middle; margin-right: 6px; border-radius: 2px; }
+
+    #placeholder {
+      position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+      color: #777; font-size: 0.95rem; text-align: center; pointer-events: none;
+    }
+
+    /* Audio toggle */
+    #audioToggle {
+      position: absolute; bottom: 8px; left: 8px;
+      padding: 0.4rem 0.8rem; background: rgba(0,0,0,0.55); color: #fff;
+      border: none; border-radius: 6px; font-weight: 600; cursor: pointer;
+      z-index: 30; font-size: 12px;
+    }
+    #audioToggle:hover { background: rgba(255,255,255,0.18); }
+
+    #tracker-stats {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px; color: #ccc; margin: 6px 0; min-height: 16px;
+    }
+    #tracker-stats .arrived  { color: #2ecc71; font-weight: 700; }
+    #tracker-stats .stuck    { color: #e74c3c; font-weight: 700; }
+    #tracker-stats .lost     { color: #e74c3c; }
+    #tracker-stats .approach { color: #f1c40f; }
+    #tracker-stats .hold     { color: #2ecc71; }
+
+    #console {
+      width: min(900px, 96vw); height: 180px; overflow-y: auto;
+      background: #1a1a1a; border-radius: 6px; padding: 6px 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px; line-height: 1.5; margin-top: 8px;
+    }
+    #console .evt  { color: #ccc; }
+    #console .ok   { color: #2ecc71; }
+    #console .err  { color: #e74c3c; }
+    #console .t1   { color: #9ec5fe; }
+    #console .tool { color: #f1c40f; }
+    #console .stt  { color: #b39ddb; }
+
+    #commandBar {
+      width: min(900px, 96vw); display: flex; gap: 6px; margin: 8px 0;
+    }
+    #userMessage {
+      flex: 1; background: #000; color: #e0e0e0; border: 1px solid #333;
+      border-radius: 6px; padding: 8px 12px; font-size: 14px; outline: none;
+    }
+    #userMessage:focus { border-color: #4f46e5; }
+    #sendBtn {
+      background: #4f46e5; color: #fff; border: none; padding: 8px 16px;
+      border-radius: 6px; font-weight: 600; cursor: pointer;
+    }
+    #sendBtn:hover { background: #6366f1; }
+    #sendBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #manualButtons {
+      display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap;
+      justify-content: center;
+    }
+    .manual-btn {
+      background: #333; color: #e0e0e0; border: none; padding: 6px 14px;
+      border-radius: 6px; font-size: 13px; cursor: pointer;
+    }
+    .manual-btn:hover { background: #555; }
+    .manual-btn[data-cmd="stop"] { background: #c0392b; color: #fff; }
+    .manual-btn[data-cmd="stop"]:hover { background: #e74c3c; }
+
+    #help { font-size: 11px; color: #777; margin-bottom: 12px; max-width: 720px;
+      text-align: center; padding: 0 12px; }
+    #help kbd { background: #333; border: 1px solid #555; border-radius: 3px;
+      padding: 0 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  </style>
+</head>
+<body>
+  <h2>LaiRA Smart Test <span class="badge">/smart_laira_test</span></h2>
+
+  <div id="status-list">
+    <div class="label">Pi link</div>
+    <div class="value"><span class="dot" id="dot-pilink"></span><span id="lbl-pilink">connecting…</span></div>
+    <div class="label">video stream</div>
+    <div class="value"><span class="dot" id="dot-video"></span><span id="lbl-video">waiting</span></div>
+    <div class="label">server config</div>
+    <div class="value"><span class="dot" id="dot-config"></span><span id="lbl-config">fetching…</span></div>
+    <div class="label">SAMURAI (Modal)</div>
+    <div class="value"><span class="dot" id="dot-modal"></span><span id="lbl-modal">checking…</span></div>
+    <div class="label">T1 endpoint</div>
+    <div class="value"><span class="dot" id="dot-t1"></span><span id="lbl-t1">unknown</span></div>
+  </div>
+
+  <div id="t1-state-row">
+    <span>T1 state:</span><span id="t1-state" class="IDLE">IDLE</span>
+    <span id="t1-action" style="color:#888"></span>
+  </div>
+
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <audio id="remoteAudio" autoplay muted style="display:none"></audio>
+    <canvas id="overlay"></canvas>
+
+    <div id="placeholder">Waiting for LaiRA's video feed…</div>
+
+    <div id="sent-log">
+      <div class="head">sent to Pi:</div>
+      <div id="sent-rows"></div>
+    </div>
+
+    <div id="legend">
+      <div><span class="sw" style="background:#00aaff"></span>SAMURAI bbox</div>
+      <div><span class="sw" style="background:#f1c40f"></span>vision-found bbox (init)</div>
+    </div>
+
+    <button id="audioToggle">🔇 Audio muted</button>
+  </div>
+
+  <div id="tracker-stats"></div>
+
+  <div id="console"></div>
+
+  <div id="commandBar">
+    <input id="userMessage" placeholder='type a command — e.g. "follow the person", "go to the green ball"'
+           autocomplete="off" />
+    <button id="sendBtn">Send</button>
+  </div>
+
+  <div id="manualButtons">
+    <button class="manual-btn" data-cmd="sit">Sit</button>
+    <button class="manual-btn" data-cmd="stand">Stand</button>
+    <button class="manual-btn" data-cmd="lie_down">Lie&nbsp;Down</button>
+    <button class="manual-btn" data-cmd="shake">Shake</button>
+    <button class="manual-btn" data-cmd="stop">Stop&nbsp;(cancel&nbsp;T1)</button>
+  </div>
+
+  <div id="help">
+    <kbd>WASD</kbd> override (cancels active T1) &nbsp;•&nbsp;
+    <kbd>L</kbd> lie down &nbsp;•&nbsp;
+    Voice: say "Laira, &lt;command&gt;" — STT runs on the Pi and is forwarded over the chat channel.
+  </div>
+
+  <script>
+  (() => {
+    // ===================================================================
+    // SECTION 0 — DOM refs and state
+    // ===================================================================
+    const $video    = document.getElementById('video');
+    const $audio    = document.getElementById('remoteAudio');
+    const $overlay  = document.getElementById('overlay');
+    const $send     = document.getElementById('sendBtn');
+    const $msg      = document.getElementById('userMessage');
+    const $console  = document.getElementById('console');
+    const $sentRows = document.getElementById('sent-rows');
+    const $t1State  = document.getElementById('t1-state');
+    const $t1Action = document.getElementById('t1-action');
+    const $stats    = document.getElementById('tracker-stats');
+    const $placeholder = document.getElementById('placeholder');
+    const $audioBtn = document.getElementById('audioToggle');
+    const ctx       = $overlay.getContext('2d');
+
+    const components = { pilink: 'busy', video: 'busy', config: 'busy', modal: 'busy', t1: 'busy' };
+
+    // T1 + tracking state. session_id is the load-bearing race-guard.
+    // (See t1_test.html for the long-form rationale.)
+    const state = {
+      modalUrl: null,
+      ws: null,                        // WebSocket to SAMURAI (Modal)
+      sessionId: 0,
+      t1SessionId: null,
+      currentSession: null,
+      t1State: 'IDLE',
+      lastSamBbox: null,
+      lastDepthCm: null,
+      lastVisionBbox: null,
+      lastVisionAt: 0,
+      sentInFlight: false,
+      bboxHistory: [],
+    };
+
+    // Pi link state — separate from SAMURAI ws (which talks to Modal).
+    const pi = {
+      socket: null,                    // WebSocket to /user (forwarded to LaiRA on the Pi)
+      laiRAConnected: false,
+      peerConnection: null,
+      remoteDescriptionSet: false,
+      candidateQueue: [],
+      handshakeTimer: null,
+      audioEnabled: false,
+    };
+
+    function newT1SessionId() {
+      return 't1-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now();
+    }
+
+    function setComponent(name, status, label) {
+      components[name] = status;
+      const dot = document.getElementById('dot-' + name);
+      const lbl = document.getElementById('lbl-' + name);
+      if (dot) { dot.classList.remove('ok','busy','err'); dot.classList.add(status); }
+      if (lbl) lbl.textContent = label;
+    }
+
+    function setT1State(s, action='') {
+      state.t1State = s;
+      $t1State.textContent = s;
+      $t1State.className = s;
+      $t1Action.textContent = action ? `(${action})` : '';
+    }
+
+    function logConsole(cls, text) {
+      const row = document.createElement('div');
+      row.className = cls;
+      row.textContent = text;
+      $console.appendChild(row);
+      while ($console.children.length > 80) $console.removeChild($console.firstChild);
+      $console.scrollTop = $console.scrollHeight;
+    }
+
+    function logSent(payload) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const ts = new Date().toTimeString().slice(0, 8);
+      row.innerHTML = `<span class="ts">${ts}</span>${escapeHtml(JSON.stringify(payload))}`;
+      $sentRows.appendChild(row);
+      while ($sentRows.children.length > 40) $sentRows.removeChild($sentRows.firstChild);
+      $sentRows.scrollTop = $sentRows.scrollHeight;
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      }[c]));
+    }
+
+    // ===================================================================
+    // SECTION 1 — Pi link: WebSocket to /user + WebRTC handshake
+    // ===================================================================
+    //
+    // Mirrors user.html exactly so LaiRA-side code doesn't notice a
+    // difference. The Pi sees:
+    //   - {type:'chat-message', message: '...'}        outgoing commands
+    //   - {type:'ice-candidate', candidate: ...}       webrtc plumbing
+    //   - {type:'offer', sdp: ...} / SDP description   webrtc plumbing
+    //   - {type:'alive', ...}                          heartbeat
+    //
+    // Incoming from server:
+    //   - {type:'laiRA-connected'}        kick off webrtc handshake
+    //   - {type:'answer', ...}            webrtc
+    //   - {type:'ice-candidate', ...}     webrtc
+    //   - {type:'chat-message', message}  forwarded from Pi (incl. STT)
+    function openPiSocket() {
+      setComponent('pilink', 'busy', 'connecting…');
+      const url = 'wss://' + window.location.hostname + '/user';
+      pi.socket = new WebSocket(url);
+
+      pi.socket.addEventListener('open', () => {
+        setComponent('pilink', 'ok', 'open');
+        logConsole('evt', 'Pi link open');
+      });
+      pi.socket.addEventListener('close', () => {
+        setComponent('pilink', 'err', 'closed');
+        logConsole('err', 'Pi link closed');
+        pi.laiRAConnected = false;
+        if (pi.peerConnection) {
+          try { pi.peerConnection.close(); } catch(_) {}
+          pi.peerConnection = null;
+          pi.remoteDescriptionSet = false;
+          pi.candidateQueue = [];
+        }
+      });
+      pi.socket.addEventListener('error', () => {
+        setComponent('pilink', 'err', 'error');
+      });
+      pi.socket.addEventListener('message', onPiMessage);
+    }
+
+    async function onPiMessage(event) {
+      try {
+        const data = await (event.data instanceof Blob ? event.data.text() : event.data);
+        const parsed = JSON.parse(data);
+
+        if (parsed.type === 'laiRA-connected') {
+          // Debounce: server sometimes emits this multiple times rapidly.
+          // Same pattern as user.html — wait 200ms then start a fresh handshake.
+          if (pi.handshakeTimer) clearTimeout(pi.handshakeTimer);
+          pi.handshakeTimer = setTimeout(() => {
+            pi.handshakeTimer = null;
+            if (pi.peerConnection) {
+              try { pi.peerConnection.close(); } catch(_) {}
+              pi.peerConnection = null;
+              pi.remoteDescriptionSet = false;
+              pi.candidateQueue = [];
+            }
+            logConsole('evt', 'LaiRA connected — starting WebRTC handshake');
+            startPeerConnection();
+          }, 200);
+          pi.laiRAConnected = true;
+        } else if (parsed.type === 'answer') {
+          if (!pi.peerConnection) return;
+          await pi.peerConnection.setRemoteDescription(parsed);
+          pi.remoteDescriptionSet = true;
+          for (const c of pi.candidateQueue) await pi.peerConnection.addIceCandidate(c);
+          pi.candidateQueue = [];
+        } else if (parsed.type === 'ice-candidate') {
+          if (!pi.peerConnection) return;
+          const cand = new RTCIceCandidate(parsed.candidate);
+          if (pi.remoteDescriptionSet) await pi.peerConnection.addIceCandidate(cand);
+          else pi.candidateQueue.push(cand);
+        } else if (parsed.type === 'chat-message') {
+          // The /user socket forwards Pi→server→us. The interesting payloads
+          // here are STT transcripts ("[STT] ..."). Pipe them into the
+          // orchestrator on a wake word; ignore everything else.
+          const msg = parsed.message ?? '';
+          if (typeof msg === 'string' && msg.startsWith('[STT]')) {
+            const phrase = msg.replace(/^\[STT\]\s*/, '').trim();
+            handleStt(phrase);
+          }
+        }
+      } catch (err) {
+        console.error('onPiMessage error', err);
+      }
+    }
+
+    async function startPeerConnection() {
+      try {
+        const resp = await fetch('/turn-credentials');
+        const iceServers = await resp.json();
+        pi.peerConnection = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' });
+        pi.peerConnection.addTransceiver('video', { direction: 'recvonly' });
+        pi.peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+
+        pi.peerConnection.ontrack = (ev) => {
+          const stream = ev.streams[0];
+          if (ev.track.kind === 'video') {
+            $video.srcObject = stream;
+            // Once the first frame arrives, the canvas needs to be sized
+            // and the placeholder hidden. We hook loadedmetadata once.
+            $video.addEventListener('loadedmetadata', () => {
+              $overlay.width = $video.videoWidth;
+              $overlay.height = $video.videoHeight;
+              $placeholder.style.display = 'none';
+              setComponent('video', 'ok', `live (${$video.videoWidth}×${$video.videoHeight})`);
+            }, { once: true });
+          } else if (ev.track.kind === 'audio') {
+            $audio.srcObject = stream;
+          }
+        };
+
+        pi.peerConnection.onicecandidate = ({ candidate }) => {
+          if (candidate && pi.socket && pi.socket.readyState === WebSocket.OPEN) {
+            pi.socket.send(JSON.stringify({ type: 'ice-candidate', candidate: candidate.toJSON() }));
+          }
+        };
+
+        const offer = await pi.peerConnection.createOffer();
+        await pi.peerConnection.setLocalDescription(offer);
+        pi.socket.send(JSON.stringify(pi.peerConnection.localDescription));
+      } catch (err) {
+        console.error('Peer connection error', err);
+        logConsole('err', 'WebRTC handshake failed: ' + err.message);
+        setComponent('video', 'err', 'handshake failed');
+      }
+    }
+
+    // Audio toggle (audio starts muted; user must click to enable, browsers
+    // disallow autoplay of non-muted audio without a user gesture).
+    $audioBtn.addEventListener('click', async () => {
+      if (!$audio.srcObject) { logConsole('evt', 'no audio stream yet'); return; }
+      if (pi.audioEnabled) {
+        $audio.muted = true; $audio.pause();
+        $audioBtn.textContent = '🔇 Audio muted';
+      } else {
+        try {
+          await $audio.play();
+          $audio.muted = false;
+          $audioBtn.textContent = '🔈 Audio on';
+        } catch (e) { logConsole('err', 'audio resume failed: ' + e.message); return; }
+      }
+      pi.audioEnabled = !pi.audioEnabled;
+    });
+
+    // Heartbeat — same shape as user.html so LaiRA's link-watchdog is happy.
+    setInterval(() => {
+      if (pi.socket && pi.socket.readyState === WebSocket.OPEN) {
+        pi.socket.send(JSON.stringify({ type: 'alive', message: JSON.stringify({ alive: 'healthy' }) }));
+      }
+    }, 5000);
+
+    // ===================================================================
+    // SECTION 2 — Server config (Modal URL) + Modal warmup + T1 sanity ping
+    // ===================================================================
+    async function loadConfig() {
+      setComponent('config', 'busy', 'fetching…');
+      try {
+        const resp = await fetch('/api/config');
+        const cfg = await resp.json();
+        if (!cfg.modalTrackerUrl) {
+          setComponent('config', 'err', 'MODAL_TRACKER_URL not set on server');
+          return;
+        }
+        state.modalUrl = cfg.modalTrackerUrl.replace(/\/+$/, '');
+        setComponent('config', 'ok', 'loaded');
+      } catch (err) {
+        setComponent('config', 'err', err.message);
+      }
+    }
+
+    async function prewarmModal() {
+      if (!state.modalUrl) { setComponent('modal', 'err', 'no URL'); return; }
+      setComponent('modal', 'busy', 'warming up (≤60s on cold start)…');
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 90000);
+      try {
+        const t0 = performance.now();
+        const r = await fetch(state.modalUrl + '/healthz', { signal: ctrl.signal });
+        clearTimeout(t);
+        if (!r.ok) { setComponent('modal', 'err', 'healthz http ' + r.status); return; }
+        setComponent('modal', 'ok', `ready (${Math.round(performance.now()-t0)}ms)`);
+      } catch (err) {
+        clearTimeout(t);
+        setComponent('modal', 'err', err.name === 'AbortError' ? 'timeout' : err.message);
+      }
+    }
+
+    async function pingT1() {
+      setComponent('t1', 'busy', 'checking…');
+      try {
+        const r = await fetch('/api/t1', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        if (r.status === 400) setComponent('t1', 'ok', 'reachable');
+        else if (r.status === 404) setComponent('t1', 'err', '404 — server not redeployed?');
+        else setComponent('t1', 'ok', `reachable (http ${r.status})`);
+      } catch (err) {
+        setComponent('t1', 'err', err.message);
+      }
+    }
+
+    // ===================================================================
+    // SECTION 3 — Pi command primitives (the "actually send" layer)
+    // ===================================================================
+    //
+    // Replaces t1_test.html's wouldSendChat. Same payload shapes — the only
+    // difference is they go out over a real WebSocket to the Pi instead of
+    // landing in a red overlay.
+    function sendChatToPi(payload) {
+      logSent(payload);
+      if (!pi.socket || pi.socket.readyState !== WebSocket.OPEN) {
+        logConsole('err', 'Pi link not open — drop ' + JSON.stringify(payload));
+        return;
+      }
+      pi.socket.send(JSON.stringify({
+        type: 'chat-message',
+        message: JSON.stringify(payload),
+      }));
+    }
+
+    // Pose payloads — copied verbatim from user.html so the Pi receives
+    // exactly what it expects from its existing handlers.
+    const POSE_PAYLOADS = {
+      sit:      { angle: [[90,172,142],[90,200,50],[90,170,144],[90,200,50]] },
+      lie_down: { angle: [[90,200,135],[90,200,135],[90,200,135],[90,200,135]] },
+      shake:    { angle: [[90,200,113],[90,200,50],[90,170,144],[120,260,0]] },
+      // "stand" in user.html is just zero-keystate.
+      stand:    { keystates: { w:'False', a:'False', s:'False', d:'False', q:'False', e:'False' } },
+    };
+
+    function executePose(name) {
+      const p = POSE_PAYLOADS[name];
+      if (!p) { logConsole('err', `unknown pose: ${name}`); return; }
+      sendChatToPi(p);
+      // Multi-step chains mirror user.html's setTimeout sequencing.
+      if (name === 'lie_down') {
+        setTimeout(() => sendChatToPi({ action: 'rest' }), 500);
+      } else if (name === 'shake') {
+        setTimeout(() => sendChatToPi({ angle: [[90,200,113],[90,240,100],[90,170,144],[120,260,0]] }), 500);
+        setTimeout(() => sendChatToPi({ action: 'shake' }), 1000);
+      }
+    }
+
+    function executeKeystate(ks) {
+      const full = { w:false, a:false, s:false, d:false, q:false, e:false, ...ks };
+      const stringified = {};
+      for (const k in full) stringified[k] = full[k] ? 'True' : 'False';
+      sendChatToPi({ keystates: stringified });
+    }
+
+    // Manual button handlers — each cancels any active T1 first.
+    document.querySelectorAll('.manual-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const cmd = btn.dataset.cmd;
+        cancelActiveSession('manual button');
+        if (cmd === 'stop') { executeKeystate({}); return; }
+        executePose(cmd);
+      });
+    });
+
+    // WASD/QE keyboard override — cancels active T1, then drives.
+    const KEY_STATES = { w:false, a:false, s:false, d:false, q:false, e:false };
+    let lastKeystateSent = '';
+    document.addEventListener('keydown', e => {
+      if (document.activeElement === $msg) return;
+      const k = e.key.toLowerCase();
+      if (k === 'l') { cancelActiveSession('manual L key'); executePose('lie_down'); return; }
+      if (k in KEY_STATES) {
+        if (!KEY_STATES[k]) { cancelActiveSession('manual key: ' + k); KEY_STATES[k] = true; sendKeystatesIfChanged(); }
+      }
+    });
+    document.addEventListener('keyup', e => {
+      const k = e.key.toLowerCase();
+      if (k in KEY_STATES) { KEY_STATES[k] = false; sendKeystatesIfChanged(); }
+    });
+    function sendKeystatesIfChanged() {
+      const sig = JSON.stringify(KEY_STATES);
+      if (sig !== lastKeystateSent) { lastKeystateSent = sig; executeKeystate(KEY_STATES); }
+    }
+
+    // ===================================================================
+    // SECTION 4 — Frame grab + vision call
+    // The `<video>` element here is fed by WebRTC; grabbing pixels works
+    // identically to a webcam-fed video as long as the remote stream is
+    // live and the canvas can read it (CORS-friendly since same-origin).
+    // ===================================================================
+    function grabFrameJpegB64(quality=0.8) {
+      const c = document.createElement('canvas');
+      c.width = $video.videoWidth;
+      c.height = $video.videoHeight;
+      c.getContext('2d').drawImage($video, 0, 0);
+      return c.toDataURL('image/jpeg', quality).split(',', 2)[1];
+    }
+
+    async function callVision(target, purpose) {
+      const frame = grabFrameJpegB64(0.85);
+      const W = $video.videoWidth, H = $video.videoHeight;
+      const r = await fetch('/api/vision', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ frame, message: target, width: W, height: H, purpose }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(`vision ${r.status}: ${JSON.stringify(data)}`);
+      data.frame = frame;
+      return data;
+    }
+
+    // ===================================================================
+    // SECTION 5 — SAMURAI session client (Modal WebSocket)
+    // Lifted whole-cloth from t1_test.html.
+    // ===================================================================
+    function openSamWs() {
+      return new Promise((resolve, reject) => {
+        const wsUrl = state.modalUrl.replace(/^http/, 'ws') + '/ws';
+        const ws = new WebSocket(wsUrl);
+        ws.onopen = () => resolve(ws);
+        ws.onerror = () => reject(new Error('SAMURAI ws error'));
+        ws.onmessage = e => onSamMessage(JSON.parse(e.data));
+        ws.onclose = () => { state.ws = null; };
+      });
+    }
+
+    async function ensureWs() {
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) return;
+      state.ws = await openSamWs();
+    }
+
+    function onSamMessage(msg) {
+      const sess = state.currentSession;
+      if (!sess || msg.session_id !== sess.samuraiSessionId) return;
+
+      if (msg.type === 'init_ok') {
+        logConsole('ok', `SAMURAI init_ok (${JSON.stringify(msg.bbox)})`);
+        state.lastSamBbox = msg.bbox;
+        startSamuraiLoop();
+      } else if (msg.type === 'init_fail') {
+        logConsole('err', `SAMURAI init_fail: ${msg.error || ''}`);
+        finishSession('init_fail');
+      } else if (msg.type === 'bbox') {
+        state.sentInFlight = false;
+        state.lastSamBbox = msg.bbox;
+        const depthCm = (msg.debug && msg.debug.depth_cm != null) ? msg.debug.depth_cm : null;
+        state.lastDepthCm = depthCm;
+        if (msg.bbox) onBboxArrived(msg.bbox, depthCm);
+        else onBboxLost();
+      } else if (msg.type === 'error') {
+        state.sentInFlight = false;
+        if (msg.error === 'no session') {
+          logConsole('evt', 'SAMURAI lost session, re-initing');
+          if (state.lastSamBbox) reinitSession();
+          else finishSession('session_lost');
+        }
+      }
+    }
+
+    async function reinitSession() {
+      const sess = state.currentSession; if (!sess) return;
+      const frame = grabFrameJpegB64(0.85);
+      const [x, y, w, h] = state.lastSamBbox;
+      sess.samuraiSessionId = 'sam-' + Math.random().toString(36).slice(2, 10);
+      state.ws.send(JSON.stringify({
+        type: 'init', session_id: sess.samuraiSessionId,
+        frame, bbox: [x, y, x+w, y+h],
+      }));
+    }
+
+    async function startSamuraiSession(initBbox, initFrame) {
+      const sess = state.currentSession;
+      sess.samuraiSessionId = 'sam-' + Math.random().toString(36).slice(2, 10);
+      state.lastVisionBbox = initBbox;
+      state.lastVisionAt = performance.now();
+      state.bboxHistory = [];
+      state.lastSamBbox = initBbox;
+
+      await ensureWs();
+      const frame = initFrame || grabFrameJpegB64(0.85);
+      const [x, y, w, h] = initBbox;
+      state.ws.send(JSON.stringify({
+        type: 'init', session_id: sess.samuraiSessionId,
+        frame, bbox: [x, y, x+w, y+h],
+      }));
+    }
+
+    function startSamuraiLoop() {
+      const sess = state.currentSession;
+      if (!sess) return;
+      sess.rafActive = true;
+      const tick = () => {
+        if (!sess.rafActive) return;
+        if (!state.sentInFlight && state.ws && state.ws.readyState === WebSocket.OPEN) {
+          state.sentInFlight = true;
+          state.ws.send(JSON.stringify({
+            type: 'track', session_id: sess.samuraiSessionId,
+            frame: grabFrameJpegB64(0.7),
+          }));
+        }
+        drawOverlay();
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }
+
+    function stopSamuraiSession() {
+      const sess = state.currentSession;
+      if (sess) sess.rafActive = false;
+      if (state.ws && state.ws.readyState === WebSocket.OPEN && sess) {
+        try { state.ws.send(JSON.stringify({ type: 'close', session_id: sess.samuraiSessionId })); } catch (_) {}
+      }
+      state.sentInFlight = false;
+    }
+
+    // ===================================================================
+    // SECTION 6 — Motion controller (same constants and logic as t1_test)
+    // ===================================================================
+    const HISTORY_LEN = 12;
+    const DISTANCE_STABILITY_CM = 5;
+    const STABILITY_FRAMES_ARRIVED = 3;
+    const DISTANCE_TOL_CM = 8;
+    const FOLLOW_BAND_CM = 20;
+    const LOST_GRACE_MS = 2000;
+    const HORIZ_DEADZONE_FRAC = 0.156;
+    const STUCK_MIN_ELAPSED_MS    = 6000;
+    const STUCK_REGRESSION_CM     = 20;
+    const STUCK_REGRESSION_DUR_MS = 3000;
+    const PROGRESS_TOL_CM         = 5;
+
+    function pushBboxHistory(bbox, depthCm) {
+      const [x, y, w, h] = bbox;
+      state.bboxHistory.push({
+        x, y, w, h,
+        cx: x + w/2,
+        depthCm: (depthCm == null ? null : depthCm),
+        t: performance.now(),
+      });
+      while (state.bboxHistory.length > HISTORY_LEN) state.bboxHistory.shift();
+    }
+
+    function isDistanceStableForFrames(n) {
+      if (state.bboxHistory.length < n) return false;
+      const tail = state.bboxHistory.slice(-n);
+      const depths = tail.map(b => b.depthCm).filter(d => d != null);
+      if (depths.length < n) return false;
+      const min = Math.min(...depths), max = Math.max(...depths);
+      return (max - min) <= DISTANCE_STABILITY_CM;
+    }
+
+    function computeKeystatesAndStatus(bbox, depthCm) {
+      // Sequential turn-then-walk because the Pi currently drops simultaneous
+      // w+a/d. Same active behavior as t1_test.html — see the long-form
+      // comment there. Once the Pi accepts simultaneous wasd, restore the
+      // arc-motion variant in BOTH files.
+      const sess = state.currentSession;
+      const W = $video.videoWidth;
+      const [x, , w] = bbox;
+      const cx = x + w/2;
+      const offset = cx - W/2;
+      const ks = { w:false, a:false, s:false, d:false, q:false, e:false };
+      let arrived = false, stuck = false;
+      let status = 'tracking';
+
+      const horizDeadzone = W * HORIZ_DEADZONE_FRAC;
+      const target = sess.targetDistanceCm;
+      const centered = Math.abs(offset) <= horizDeadzone;
+
+      let turnPart = '';
+      let distPart = '';
+      if (!centered) {
+        if (offset > 0) { ks.d = true; turnPart = 'right'; }
+        else            { ks.a = true; turnPart = 'left'; }
+      }
+
+      if (sess.mode === 'go_to') {
+        if (depthCm == null) {
+          if (centered) { ks.w = true; }
+          distPart = 'approaching (no depth)';
+          status = 'approach';
+        } else if (depthCm > target + DISTANCE_TOL_CM) {
+          if (centered) { ks.w = true; }
+          distPart = `approaching (Δ=${(depthCm - target).toFixed(0)}cm)`;
+          status = 'approach';
+        } else {
+          distPart = 'at distance';
+          status = centered ? 'arrived' : 'approach';
+        }
+
+        if (depthCm != null) {
+          const now = performance.now();
+          if (sess.bestDepthCm == null) {
+            sess.bestDepthCm = depthCm; sess.bestDepthAt = now; sess.regressedSinceMs = null;
+          } else if (depthCm < sess.bestDepthCm - PROGRESS_TOL_CM) {
+            sess.bestDepthCm = depthCm; sess.bestDepthAt = now; sess.regressedSinceMs = null;
+          } else if (depthCm > sess.bestDepthCm + STUCK_REGRESSION_CM) {
+            if (sess.regressedSinceMs == null) sess.regressedSinceMs = now;
+          } else {
+            sess.regressedSinceMs = null;
+          }
+
+          const distStable = isDistanceStableForFrames(STABILITY_FRAMES_ARRIVED);
+          if (distStable && centered && depthCm <= target + DISTANCE_TOL_CM) {
+            arrived = true;
+          } else if (depthCm > target + DISTANCE_TOL_CM) {
+            const elapsed = now - sess.startedAt;
+            const regressedFor = sess.regressedSinceMs == null ? 0 : now - sess.regressedSinceMs;
+            if (elapsed >= STUCK_MIN_ELAPSED_MS && regressedFor >= STUCK_REGRESSION_DUR_MS) {
+              stuck = true;
+            }
+          }
+        }
+      } else {
+        if (depthCm == null) { distPart = 'following (no depth)'; status = 'hold'; }
+        else if (depthCm < target - FOLLOW_BAND_CM) { ks.s = true; distPart = `backing off (Δ=${(target - depthCm).toFixed(0)}cm)`; status = 'approach'; }
+        else if (depthCm > target + FOLLOW_BAND_CM) { ks.w = true; distPart = `closing (Δ=${(depthCm - target).toFixed(0)}cm)`; status = 'approach'; }
+        else { distPart = 'holding distance'; status = centered ? 'hold' : 'approach'; }
+      }
+
+      let action;
+      if (turnPart && distPart) action = `${distPart} + turn ${turnPart}`;
+      else if (turnPart)         action = `centering: turn ${turnPart}`;
+      else                       action = distPart || 'tracking';
+
+      return { keystates: ks, action, arrived, stuck, depthCm, offset, status };
+    }
+
+    function renderTrackerStats(info) {
+      if (!info) { $stats.textContent = ''; return; }
+      const dist = info.depthCm == null ? '—' : `${info.depthCm}cm`;
+      const tgt  = info.target == null ? '—' : `${info.target}cm`;
+      const delta = (info.depthCm != null && info.target != null)
+        ? `Δ=${(info.depthCm - info.target).toFixed(0)}cm` : 'Δ=—';
+      const cls = ({
+        arrived:'arrived', stuck:'stuck', lost:'lost', approach:'approach', hold:'hold',
+      })[info.status] || '';
+      $stats.innerHTML = `mode=${info.mode}  dist=${dist}  target=${tgt}  ${delta}  ` +
+        `<span class="${cls}">[${info.action}]</span>`;
+    }
+
+    let lastTrackingKeystateSig = '';
+
+    function onBboxArrived(bbox, depthCm) {
+      const sess = state.currentSession;
+      if (!sess) return;
+      pushBboxHistory(bbox, depthCm);
+      sess.lastBboxAt = performance.now();
+      const info = computeKeystatesAndStatus(bbox, depthCm);
+      const { keystates, action, arrived, stuck } = info;
+      setT1State('TRACKING', `${sess.mode}: ${sess.target} — ${action}`);
+      renderTrackerStats({
+        mode: sess.mode, target: sess.targetDistanceCm,
+        depthCm, action, status: info.status,
+      });
+      const sig = JSON.stringify(keystates);
+      if (sig !== lastTrackingKeystateSig) {
+        lastTrackingKeystateSig = sig;
+        executeKeystate(keystates);
+      }
+      if (arrived) {
+        logConsole('ok', `arrived at "${sess.target}" (depth=${depthCm}cm <= ${sess.targetDistanceCm}cm + ${DISTANCE_TOL_CM}cm tol)`);
+        finishSession('arrived');
+      } else if (stuck) {
+        logConsole('err', `stuck approaching "${sess.target}" — re-engaging Sonnet`);
+        reengageOnStuck(sess, depthCm);
+      }
+    }
+
+    async function reengageOnStuck(sess, lastDepthCm) {
+      stopSamuraiSession();
+      state.currentSession = null;
+      state.lastSamBbox = null;
+      state.lastDepthCm = null;
+      state.bboxHistory = [];
+      lastTrackingKeystateSig = '';
+      executeKeystate({});
+      renderTrackerStats(null);
+      ctx.clearRect(0, 0, $overlay.width, $overlay.height);
+
+      const planSid = ++state.sessionId;
+      const t1Sid = state.t1SessionId;
+      if (!t1Sid) { logConsole('err', 're-engage: no t1SessionId; ending'); setT1State('IDLE'); return; }
+      setT1State('PLANNING', 're-engaging on stuck');
+      const elapsedS = Math.round((performance.now() - sess.startedAt) / 1000);
+      const best = sess.bestDepthCm == null ? 'unknown' : `${sess.bestDepthCm}cm`;
+      const text = `STATUS: my last go_to to "${sess.target}" got stuck. ` +
+        `Target was ${sess.targetDistanceCm}cm; tried for ${elapsedS}s, ` +
+        `got as close as ${best} but then fell back to ${lastDepthCm}cm and ` +
+        `the target has been receding from me. Looking at the current frame, ` +
+        `decide what to do next: switch to follow, settle and call it done, ` +
+        `retry go_to at the achievable distance, or stop. One tool call.`;
+      logConsole('evt', `re-engage: ${text}`);
+
+      const frame = grabFrameJpegB64(0.85);
+      let r, data;
+      try {
+        r = await fetch('/api/t1', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ frame, text, session_id: t1Sid }),
+        });
+        data = await r.json();
+      } catch (err) { logConsole('err', 're-engage fetch error: ' + err.message); setT1State('IDLE'); state.t1SessionId = null; return; }
+      if (planSid !== state.sessionId) { logConsole('evt', 're-engage response after cancel; dropping'); return; }
+      if (!r.ok) { logConsole('err', `re-engage T1 error: ${JSON.stringify(data)}`); setT1State('IDLE'); state.t1SessionId = null; return; }
+      if (data.reasoning) logConsole('t1', `${data.source}: ${data.reasoning}`);
+      if (data.sonnet_reasoning) logConsole('t1', `sonnet (escalated): ${data.sonnet_reasoning}`);
+      if (!data.tools || data.tools.length === 0) { logConsole('evt', `${data.source} chose no further action`); setT1State('IDLE'); return; }
+      currentPlan = data.tools;
+      currentPlanIdx = 0;
+      currentPlanSessionId = planSid;
+      setT1State('EXECUTING');
+      runNextStep();
+    }
+
+    async function continuePlan(stepResult) {
+      logConsole('evt', `continuePlan entry (t1Sid=${state.t1SessionId ? 'set' : 'null'}, last=${stepResult})`);
+      const planSid = ++state.sessionId;
+      const t1Sid = state.t1SessionId;
+      if (!t1Sid) { setT1State('IDLE'); logConsole('ok', 'plan complete (no t1 session — early exit)'); return; }
+      setT1State('PLANNING', 'continuing plan');
+      const text = `STATUS: previous step finished — ${stepResult}. Looking at ` +
+        `the current frame and the original user request, decide your next ` +
+        `tool to continue, or call stop() if the user's request is now fully ` +
+        `satisfied. One tool call.`;
+      logConsole('evt', `continue: ${stepResult}`);
+
+      const frame = grabFrameJpegB64(0.85);
+      let r, data;
+      try {
+        r = await fetch('/api/t1', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ frame, text, session_id: t1Sid }),
+        });
+        data = await r.json();
+      } catch (err) { logConsole('err', 'continue fetch error: ' + err.message); setT1State('IDLE'); state.t1SessionId = null; return; }
+      if (planSid !== state.sessionId) { logConsole('evt', 'continue response after cancel; dropping'); return; }
+      if (!r.ok) { logConsole('err', `continue T1 error: ${JSON.stringify(data)}`); setT1State('IDLE'); state.t1SessionId = null; return; }
+      if (data.reasoning) logConsole('t1', `${data.source}: ${data.reasoning}`);
+      if (data.sonnet_reasoning) logConsole('t1', `sonnet (escalated): ${data.sonnet_reasoning}`);
+      if (!data.tools || data.tools.length === 0) { logConsole('ok', 'plan complete'); setT1State('IDLE'); return; }
+      currentPlan = data.tools;
+      currentPlanIdx = 0;
+      currentPlanSessionId = planSid;
+      setT1State('EXECUTING');
+      runNextStep();
+    }
+
+    function onBboxLost() {
+      const sess = state.currentSession; if (!sess) return;
+      const sinceLast = performance.now() - (sess.lastBboxAt || sess.startedAt);
+      renderTrackerStats({
+        mode: sess.mode, target: sess.targetDistanceCm,
+        depthCm: null, action: `lost (${Math.round(sinceLast)}ms)`, status: 'lost',
+      });
+      if (sinceLast > LOST_GRACE_MS) {
+        logConsole('err', `lost "${sess.target}" (no bbox for ${Math.round(sinceLast)}ms)`);
+        finishSession('lost');
+      }
+      const sig = JSON.stringify({});
+      if (lastTrackingKeystateSig !== sig) { lastTrackingKeystateSig = sig; executeKeystate({}); }
+    }
+
+    // ===================================================================
+    // SECTION 7 — Overlay drawing
+    // ===================================================================
+    function drawOverlay() {
+      ctx.clearRect(0, 0, $overlay.width, $overlay.height);
+      if (state.lastSamBbox) {
+        const [x, y, w, h] = state.lastSamBbox;
+        ctx.strokeStyle = '#00aaff';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(x, y, w, h);
+      }
+      if (state.lastVisionBbox && performance.now() - state.lastVisionAt < 4000) {
+        const [x, y, w, h] = state.lastVisionBbox;
+        ctx.strokeStyle = '#f1c40f';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 4]);
+        ctx.strokeRect(x, y, w, h);
+        ctx.setLineDash([]);
+      }
+    }
+
+    // ===================================================================
+    // SECTION 8 — T1 dispatch + cancellation state machine
+    // ===================================================================
+    function cancelActiveSession(reason) {
+      if (state.t1State === 'IDLE' && !state.currentSession && !state.t1SessionId && activeWaitTimer == null) return;
+      logConsole('evt', `cancel: ${reason}`);
+      if (activeWaitTimer != null) { clearTimeout(activeWaitTimer); activeWaitTimer = null; }
+      state.sessionId++;
+      stopSamuraiSession();
+      state.currentSession = null;
+      state.lastSamBbox = null;
+      state.lastDepthCm = null;
+      state.lastVisionBbox = null;
+      state.bboxHistory = [];
+      lastTrackingKeystateSig = '';
+      state.t1SessionId = null;
+      executeKeystate({});
+      setT1State('IDLE');
+      renderTrackerStats(null);
+      ctx.clearRect(0, 0, $overlay.width, $overlay.height);
+    }
+
+    function finishSession(reason) {
+      logConsole('evt', `session ended: ${reason}`);
+      const sess = state.currentSession;
+      if (sess) {
+        const dist = state.lastDepthCm == null ? '' : ` at depth=${state.lastDepthCm}cm`;
+        lastStepResult = `${sess.mode}("${sess.target}") ${reason}${dist}`;
+      }
+      stopSamuraiSession();
+      state.currentSession = null;
+      state.lastSamBbox = null;
+      state.lastDepthCm = null;
+      state.bboxHistory = [];
+      lastTrackingKeystateSig = '';
+      executeKeystate({});
+      renderTrackerStats(null);
+      runNextStep();
+    }
+
+    let currentPlan = null;
+    let currentPlanIdx = 0;
+    let currentPlanSessionId = -1;
+    let lastStepResult = null;
+    let activeWaitTimer = null;
+
+    function runNextStep() {
+      if (!currentPlan || currentPlanSessionId !== state.sessionId) {
+        currentPlan = null; setT1State('IDLE'); return;
+      }
+      if (currentPlanIdx >= currentPlan.length) {
+        currentPlan = null;
+        continuePlan(lastStepResult || 'previous step completed');
+        return;
+      }
+      const step = currentPlan[currentPlanIdx++];
+      logConsole('tool', `> ${step.tool}(${JSON.stringify(step.args || {})})`);
+      executeTool(step.tool, step.args || {});
+    }
+
+    function executeTool(tool, args) {
+      switch (tool) {
+        case 'sit':
+        case 'stand':
+        case 'lie_down':
+        case 'shake':
+          executePose(tool);
+          setTimeout(() => { lastStepResult = `${tool}() completed`; runNextStep(); }, 1100);
+          break;
+
+        case 'stop':
+          executeKeystate({});
+          state.t1SessionId = null;
+          setTimeout(() => runNextStep(), 50);
+          break;
+
+        case 'wait': {
+          const ms = Math.min(30000, Math.max(100, args.duration_ms || 1000));
+          if (activeWaitTimer != null) clearTimeout(activeWaitTimer);
+          activeWaitTimer = setTimeout(() => {
+            activeWaitTimer = null;
+            lastStepResult = `wait(${ms}ms) completed`;
+            runNextStep();
+          }, ms);
+          break;
+        }
+
+        case 'drive': {
+          // See t1_test.html for the full rationale on the DIR_MAP.
+          const DIR_MAP = {
+            forward: { w: true }, back: { s: true },
+            rotate_left:  { a: true }, rotate_right: { d: true },
+          };
+          const ks = DIR_MAP[args.direction];
+          if (!ks) { logConsole('err', `bad direction: ${args.direction}`); runNextStep(); return; }
+          const dur = Math.min(3000, Math.max(100, args.duration_ms || 500));
+          executeKeystate(ks);
+          setTimeout(() => {
+            executeKeystate({});
+            lastStepResult = `drive(${args.direction}, ${dur}ms) completed`;
+            setTimeout(() => runNextStep(), 50);
+          }, dur);
+          break;
+        }
+
+        case 'follow':
+        case 'go_to': {
+          const distCm = args.target_distance_cm;
+          if (typeof distCm !== 'number' || distCm < 5 || distCm > 300) {
+            logConsole('err', `${tool}: invalid target_distance_cm (${distCm})`);
+            runNextStep();
+            return;
+          }
+          startVisionThenTrack(tool, args.target, distCm);
+          break;
+        }
+
+        default:
+          logConsole('err', `unknown tool: ${tool}`);
+          runNextStep();
+      }
+    }
+
+    async function startVisionThenTrack(mode, target, targetDistanceCm) {
+      const planSid = state.sessionId;
+      setT1State('EXECUTING', `${mode}: ${target} @${targetDistanceCm}cm (vision lookup)`);
+      let visionResult;
+      try { visionResult = await callVision(target, mode); }
+      catch (err) { logConsole('err', `vision failed: ${err.message}`); runNextStep(); return; }
+      if (planSid !== state.sessionId) return;
+      if (!visionResult.bbox) {
+        logConsole('err', `vision could not find "${target}": ${visionResult.reasoning || ''}`);
+        runNextStep();
+        return;
+      }
+      logConsole('t1', `vision: ${visionResult.reasoning || ''}`);
+      const [x1, y1, x2, y2] = visionResult.bbox;
+      const initBbox = [x1, y1, x2 - x1, y2 - y1];
+      state.lastVisionBbox = initBbox;
+      state.lastVisionAt = performance.now();
+      state.currentSession = {
+        id: planSid, mode, target, targetDistanceCm,
+        startedAt: performance.now(),
+        bestDepthCm: null, bestDepthAt: 0, regressedSinceMs: null,
+      };
+      renderTrackerStats({
+        mode, target: targetDistanceCm, depthCm: null,
+        action: 'opening SAMURAI', status: 'approach',
+      });
+      setT1State('EXECUTING', `${mode}: ${target} @${targetDistanceCm}cm (opening SAMURAI)`);
+      try { await startSamuraiSession(initBbox, visionResult.frame); }
+      catch (err) { logConsole('err', `SAMURAI open failed: ${err.message}`); finishSession('samurai_open_failed'); }
+    }
+
+    // ===================================================================
+    // SECTION 9 — Submit handler (entry point for new T1 commands)
+    // ===================================================================
+    async function submitToOrchestrator(text, sourceLabel='user') {
+      cancelActiveSession('new T1 input');
+      $send.disabled = true;
+      setT1State('PLANNING');
+      logConsole('evt', `${sourceLabel}: ${text}`);
+
+      // Need a live video frame. If WebRTC hasn't delivered one yet, bail
+      // gracefully — the orchestrator can't reason about anything visual
+      // without a frame and we don't want to send a blank canvas.
+      if (!$video.videoWidth || !$video.videoHeight) {
+        logConsole('err', 'no video frame yet — wait for LaiRA to come online');
+        $send.disabled = false;
+        setT1State('IDLE');
+        return;
+      }
+
+      const planSid = ++state.sessionId;
+      state.t1SessionId = newT1SessionId();
+      const frame = grabFrameJpegB64(0.85);
+      try {
+        const r = await fetch('/api/t1', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ frame, text, session_id: state.t1SessionId }),
+        });
+        const data = await r.json();
+        $send.disabled = false;
+        if (planSid !== state.sessionId) { logConsole('evt', 'T1 response arrived after cancel; dropping'); return; }
+        if (!r.ok) { logConsole('err', `T1 error: ${JSON.stringify(data)}`); setT1State('IDLE'); return; }
+        if (data.reasoning) logConsole('t1', `${data.source}: ${data.reasoning}`);
+        if (data.sonnet_reasoning) logConsole('t1', `sonnet (escalated): ${data.sonnet_reasoning}`);
+        if (!data.tools || data.tools.length === 0) {
+          logConsole('evt', `${data.source} chose no action — LaiRA does nothing`);
+          setT1State('IDLE'); return;
+        }
+        currentPlan = data.tools;
+        currentPlanIdx = 0;
+        currentPlanSessionId = planSid;
+        setT1State('EXECUTING');
+        runNextStep();
+      } catch (err) {
+        $send.disabled = false;
+        logConsole('err', 'T1 fetch error: ' + err.message);
+        setT1State('IDLE');
+      }
+    }
+
+    function onSubmit() {
+      const text = $msg.value.trim();
+      if (!text) return;
+      $msg.value = '';
+      submitToOrchestrator(text, 'user');
+    }
+    $send.addEventListener('click', onSubmit);
+    $msg.addEventListener('keydown', e => { if (e.key === 'Enter') onSubmit(); });
+
+    // ===================================================================
+    // SECTION 10 — STT pipe: LaiRA's onboard mic → wake-word → orchestrator
+    //
+    // user.html's voiceCommandParse used a long list of phonetic alternates
+    // to detect the wake word and matched simple sit/shake/follow keywords.
+    // Here we keep the same wake-word recognizer (since STT misses "laira"
+    // constantly) but route everything AFTER the wake word into the
+    // orchestrator as the user's command, since the orchestrator can handle
+    // anything the keyword matcher could and a lot more.
+    // ===================================================================
+    const WAKE_ALIASES = [
+      'lyra', 'liar', 'lie r', 'laira', 'hi rest', 'virus', 'byron',
+      'why run', 'why around', 'hi rez', 'why i', 'wheras', 'iris',
+      'why rob', 'hi there', 'higher', 'i love',
+    ];
+
+    function stripWakeWord(phrase) {
+      const lower = phrase.toLowerCase();
+      // Find the latest wake-word occurrence so the command portion is
+      // everything after it. (Earliest would also work but if the user
+      // self-corrects mid-sentence the latest is more reliable.)
+      let bestIdx = -1, bestEnd = -1;
+      for (const w of WAKE_ALIASES) {
+        const i = lower.lastIndexOf(w);
+        if (i > bestIdx) { bestIdx = i; bestEnd = i + w.length; }
+      }
+      if (bestIdx < 0) return null;
+      // Trim leading punctuation/whitespace from the command portion.
+      return phrase.slice(bestEnd).replace(/^[\s,:.-]+/, '').trim();
+    }
+
+    function handleStt(phrase) {
+      logConsole('stt', `STT: "${phrase}"`);
+      const cmd = stripWakeWord(phrase);
+      if (cmd == null) return;          // no wake word — ignore
+      if (!cmd) {
+        logConsole('evt', 'wake word heard but no command after it');
+        return;
+      }
+      // Hard-coded bypass: stop/cancel should be instant, not routed through
+      // a planning round-trip. Mirrors t1_test's stop-from-Sonnet semantics.
+      const lc = cmd.toLowerCase();
+      if (/(^|\s)(stop|halt|freeze|cancel|never mind)(\s|$|[.!?])/.test(lc)) {
+        logConsole('evt', `STT stop intent: "${cmd}"`);
+        cancelActiveSession('STT stop');
+        executeKeystate({});
+        return;
+      }
+      submitToOrchestrator(cmd, 'voice');
+    }
+
+    // ===================================================================
+    // SECTION 11 — Bootstrap
+    // ===================================================================
+    openPiSocket();
+    loadConfig()
+      .then(prewarmModal)
+      .then(() => ensureWs().catch(err =>
+        logConsole('err', 'WS pre-warm failed: ' + err.message)));
+    pingT1();
+  })();
+  </script>
+</body>
+</html>

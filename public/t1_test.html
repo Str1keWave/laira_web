@@ -723,14 +723,17 @@ function computeKeystatesAndStatus(bbox, depthCm) {
       // Returns { keystates, action, arrived, stuck, depthCm, offset, status }.
       //
       // ┌──────────────────────────────────────────────────────────────────┐
-      // │ FLAG — verify with real LaiRA before MVP-on-Pi wireup:           │
-      // │ This composes turn (a/d) + forward (w/s) keystates SIMULTANEOUSLY│
-      // │ when off-center AND not at distance — letting LaiRA walk an arc  │
-      // │ toward the target instead of stopping forward motion every time  │
-      // │ she has to re-center. Quadruped firmware *should* accept w+a or  │
-      // │ w+d in one keystate frame, but I haven't actually confirmed that │
-      // │ on the Pi. If she drops forward motion when a/d is added, fall   │
-      // │ back to sequential (turn-then-walk) — that's the prior behavior. │
+      // │ Pi-side limitation (CONFIRMED BROKEN 2026-04-23):                │
+      // │ LaiRA's Pi key-handling drops BOTH keystates when w+a or w+d are │
+      // │ pressed together (mutually-exclusive if/elif in laira_go.py).    │
+      // │ So we currently run sequential: if off-center, ONLY turn; if     │
+      // │ centered, ONLY walk. This produces stop-turn-walk-stop-turn      │
+      // │ jitter, but at least LaiRA actually moves.                       │
+      // │                                                                  │
+      // │ The commented arc-motion block below composes turn + forward in  │
+      // │ a single keystate frame — that's what we WANT (smoother arc      │
+      // │ pursuit). Restore it once the Pi is fixed to handle simultaneous │
+      // │ wasd. See memory: laira_mvp_pi_verify.md.                        │
       // └──────────────────────────────────────────────────────────────────┘
       const sess = state.currentSession;
       const W = $video.videoWidth;
@@ -745,30 +748,60 @@ function computeKeystatesAndStatus(bbox, depthCm) {
       const target = sess.targetDistanceCm;
       const centered = Math.abs(offset) <= horizDeadzone;
 
-      // Turn (a/d): set whenever off-center, regardless of distance.
+      // === ACTIVE: sequential turn-then-walk (Pi w+a/d limitation) ===
+      // Turn (a/d): if off-center, ONLY turn — do not also set w/s, since
+      // the Pi will drop both keystates if both are present.
       let turnPart = '';
+      let distPart = '';
       if (!centered) {
         if (offset > 0) { ks.d = true; turnPart = 'right'; }
         else            { ks.a = true; turnPart = 'left'; }
       }
 
-      // Distance (w/s): set forward/back regardless of centering — combined
-      // with turn keystates above, this produces an arc-toward-target motion
-      // instead of stop-turn-walk-stop-turn.
-      let distPart = '';
       if (sess.mode === 'go_to') {
         if (depthCm == null) {
-          ks.w = true;
+          if (centered) { ks.w = true; }
           distPart = 'approaching (no depth)';
           status = 'approach';
         } else if (depthCm > target + DISTANCE_TOL_CM) {
-          ks.w = true;
+          if (centered) { ks.w = true; }
           distPart = `approaching (Δ=${(depthCm - target).toFixed(0)}cm)`;
           status = 'approach';
         } else {
           distPart = 'at distance';
           status = centered ? 'arrived' : 'approach';
         }
+      }
+      // === /ACTIVE ===
+
+      // === COMMENTED: arc-motion (preferred — restore once Pi accepts w+a/d) ===
+      // Set turn (a/d) whenever off-center, regardless of distance.
+      // Set forward/back (w/s) regardless of centering. Combining them
+      // produces a smooth arc toward the target instead of jittery
+      // stop-turn-walk-stop-turn. Matches what we want for pursuit.
+      //
+      //   let turnPart = '';
+      //   if (!centered) {
+      //     if (offset > 0) { ks.d = true; turnPart = 'right'; }
+      //     else            { ks.a = true; turnPart = 'left'; }
+      //   }
+      //   let distPart = '';
+      //   if (sess.mode === 'go_to') {
+      //     if (depthCm == null) {
+      //       ks.w = true;
+      //       distPart = 'approaching (no depth)';
+      //       status = 'approach';
+      //     } else if (depthCm > target + DISTANCE_TOL_CM) {
+      //       ks.w = true;
+      //       distPart = `approaching (Δ=${(depthCm - target).toFixed(0)}cm)`;
+      //       status = 'approach';
+      //     } else {
+      //       distPart = 'at distance';
+      //       status = centered ? 'arrived' : 'approach';
+      //     }
+      // === /COMMENTED ===
+
+      if (sess.mode === 'go_to') {
 
         // arrived / stuck only meaningful for go_to with depth.
         if (depthCm != null) {
