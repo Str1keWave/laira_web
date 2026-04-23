@@ -261,7 +261,7 @@ function extractToolCalls(anthropicPayload, validNames) {
   return { tools, reasoning: reasoning.trim() };
 }
 
-async function callAnthropic(model, system, tools, content) {
+async function callAnthropic(model, system, tools, messages) {
   const apiKey = process.env.T1_PROMPT_KEY;
   if (!apiKey) throw new Error('T1_PROMPT_KEY not set on server');
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -276,7 +276,7 @@ async function callAnthropic(model, system, tools, content) {
       max_tokens: 1024,
       system,
       tools,
-      messages: [{ role: 'user', content }],
+      messages,
     }),
   });
   if (!resp.ok) {
@@ -289,11 +289,61 @@ async function callAnthropic(model, system, tools, content) {
   return await resp.json();
 }
 
+// --- T1 conversation session store ---
+//
+// Sessions hold the message[] history for /api/t1 calls that share a
+// session_id. The orchestrator uses this for *within-plan* continuity —
+// e.g. when a go_to gets stuck and the client re-engages Sonnet with a
+// status update, Sonnet sees her own original plan and can decide whether
+// to retry, settle, or give up.
+//
+// Lifecycle:
+//   - Client generates a session_id when the user issues a fresh command.
+//   - Each /api/t1 call appends (user_turn, assistant_summary) to the session.
+//   - When the orchestrator emits stop(), the session is deleted server-side
+//     so the next call with the same id starts fresh — matches user spec.
+//   - Idle sessions evict after T1_SESSION_TTL_MS to bound memory.
+//
+// Storage tricks:
+//   - We strip image content blocks from prior user turns (replace with text
+//     marker) before storing — Sonnet doesn't need yesterday's frame to
+//     remember yesterday's plan, and old frames bloat both the store and
+//     subsequent API payloads.
+//   - We store assistant turns as plain text summaries of the tool calls,
+//     not the raw tool_use blocks. This sidesteps the API's requirement
+//     that tool_use must be followed by tool_result — we never executed
+//     tools server-side, so there's no result to fake. Plain text reads
+//     fine to the model and is correctly formatted.
+const T1_SESSIONS = new Map();
+const T1_SESSION_TTL_MS = 10 * 60 * 1000;
+
+function pruneT1Sessions() {
+  const now = Date.now();
+  for (const [sid, s] of T1_SESSIONS) {
+    if (now - s.lastTouch > T1_SESSION_TTL_MS) T1_SESSIONS.delete(sid);
+  }
+}
+
+function stripFramesFromUserContent(content) {
+  return content.map(b => b.type === 'image'
+    ? { type: 'text', text: '[prior camera frame omitted]' }
+    : b);
+}
+
+function summarizeAssistantTurn(toolList, reasoning) {
+  const calls = (toolList || [])
+    .map(t => `${t.tool}(${JSON.stringify(t.args || {})})`)
+    .join('; ');
+  const text = (reasoning ? reasoning.trim() + '\n' : '') +
+    (calls ? `Plan: ${calls}` : 'Plan: (no tools)');
+  return { role: 'assistant', content: text };
+}
+
 // --- Endpoint ----------------------------------------------------------
 
 app.post('/api/t1', async (req, res) => {
   try {
-    const { frame, text } = req.body || {};
+    const { frame, text, session_id } = req.body || {};
     if (!frame || !text) {
       return res.status(400).json({ error: 'missing frame or text' });
     }
@@ -303,34 +353,63 @@ app.post('/api/t1', async (req, res) => {
       { type: 'text', text },
     ];
 
+    // Pull prior conversation history if the client is continuing a session.
+    const sessRecord = session_id ? T1_SESSIONS.get(session_id) : null;
+    const priorMessages = sessRecord ? sessRecord.messages : [];
+    const messagesForCall = [...priorMessages, { role: 'user', content: userContent }];
+
     // Tier 1: Sonnet
     const sonnetPayload = await callAnthropic(
-      'claude-sonnet-4-6', SONNET_SYSTEM, SONNET_TOOLS, userContent
+      'claude-sonnet-4-6', SONNET_SYSTEM, SONNET_TOOLS, messagesForCall
     );
     const sonnetResult = extractToolCalls(sonnetPayload, VALID_SONNET_TOOL_NAMES);
 
     // Did Sonnet escalate? If yes, chain to Opus with the SAME user input.
     // Per the user's spec, escalate carries no args — Opus re-plans from
-    // the raw utterance + frame. Cleaner than relaying Sonnet's partial reasoning.
+    // the raw utterance + frame (and the same prior history). Cleaner than
+    // relaying Sonnet's partial reasoning.
     const escalated = sonnetResult.tools.some(t => t.tool === 'escalate');
 
+    let finalSource, finalReasoning, finalTools;
+    let extraSonnetReasoning;
     if (escalated) {
       const opusPayload = await callAnthropic(
-        'claude-opus-4-7', OPUS_SYSTEM, OPUS_TOOLS, userContent
+        'claude-opus-4-7', OPUS_SYSTEM, OPUS_TOOLS, messagesForCall
       );
       const opusResult = extractToolCalls(opusPayload, VALID_OPUS_TOOL_NAMES);
-      return res.json({
-        source: 'opus',
-        sonnet_reasoning: sonnetResult.reasoning,
-        reasoning: opusResult.reasoning,
-        tools: opusResult.tools,
-      });
+      finalSource = 'opus';
+      finalReasoning = opusResult.reasoning;
+      finalTools = opusResult.tools;
+      extraSonnetReasoning = sonnetResult.reasoning;
+    } else {
+      finalSource = 'sonnet';
+      finalReasoning = sonnetResult.reasoning;
+      finalTools = sonnetResult.tools;
+    }
+
+    // Persist this turn to the session store so a follow-up call (e.g.
+    // re-engage on stuck) sees what was planned.
+    if (session_id) {
+      const storedUserTurn = {
+        role: 'user', content: stripFramesFromUserContent(userContent),
+      };
+      const storedAssistantTurn = summarizeAssistantTurn(finalTools, finalReasoning);
+      const messages = [...priorMessages, storedUserTurn, storedAssistantTurn];
+      T1_SESSIONS.set(session_id, { messages, lastTouch: Date.now() });
+
+      // Spec: stop() ends the T1 session. Drop server-side state so the
+      // next call with this id starts fresh.
+      if (finalTools.some(t => t.tool === 'stop')) {
+        T1_SESSIONS.delete(session_id);
+      }
+      pruneT1Sessions();
     }
 
     return res.json({
-      source: 'sonnet',
-      reasoning: sonnetResult.reasoning,
-      tools: sonnetResult.tools,
+      source: finalSource,
+      reasoning: finalReasoning,
+      tools: finalTools,
+      ...(extraSonnetReasoning ? { sonnet_reasoning: extraSonnetReasoning } : {}),
     });
   } catch (err) {
     console.error('/api/t1 error', err);

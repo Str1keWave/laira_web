@@ -265,11 +265,20 @@
     const components = { camera: 'busy', config: 'busy', modal: 'busy', t1: 'busy' };
 
     // T1 + tracking state. session_id is the load-bearing race-guard.
+    //
+    // t1SessionId vs sessionId — two different "session" notions:
+    //   - sessionId is a CLIENT-ONLY counter that race-guards async callbacks
+    //     (vision, SAMURAI, in-flight T1 fetch). Bumped on every cancel.
+    //   - t1SessionId is the SERVER conversation id for /api/t1. Persists
+    //     across multiple calls within the same plan (e.g. re-engage on stuck)
+    //     so Sonnet remembers her own prior plan. Cleared when Sonnet emits
+    //     stop() or the user manually cancels.
     const state = {
       modalUrl: null,
       ws: null,                        // WebSocket to SAMURAI
       sessionId: 0,                    // counter; bumped on every new T1 invocation
-      currentSession: null,            // { id, mode, target, doneAreaFrac, ... }
+      t1SessionId: null,               // server-side conversation id for /api/t1
+      currentSession: null,            // { id, mode, target, ... }
       t1State: 'IDLE',                 // IDLE | PLANNING | EXECUTING | TRACKING
       lastSamBbox: null,
       lastDepthCm: null,               // most recent depth_cm from worker
@@ -279,6 +288,10 @@
       // Sliding history for arrived/stuck detection — recent bbox+depth stats.
       bboxHistory: [],                 // [{x, y, w, h, cx, depthCm, t}]
     };
+
+    function newT1SessionId() {
+      return 't1-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now();
+    }
 
     function setComponent(name, status, label) {
       components[name] = status;
@@ -788,9 +801,84 @@
         logConsole('ok', `arrived at "${sess.target}" (depth=${depthCm}cm <= target=${sess.targetDistanceCm}cm + ${DISTANCE_TOL_CM}cm tol)`);
         finishSession('arrived');
       } else if (stuck) {
-        logConsole('err', `stuck approaching "${sess.target}" (depth=${depthCm}cm stable above target=${sess.targetDistanceCm}cm)`);
-        finishSession('stuck');
+        logConsole('err', `stuck approaching "${sess.target}" (depth=${depthCm}cm stable above target=${sess.targetDistanceCm}cm) — re-engaging Sonnet`);
+        // Don't finish — let Sonnet decide. She has session continuity from
+        // the original plan, so the message just needs to describe what happened.
+        reengageOnStuck(sess, depthCm);
       }
+    }
+
+    // Called from onBboxArrived when go_to has plateaued above target. Tears
+    // down the SAMURAI session (we won't be reusing it) but keeps t1SessionId
+    // intact so Sonnet sees her own original plan and can decide what next:
+    // settle, try a different angle, swap to follow, give up, etc.
+    async function reengageOnStuck(sess, lastDepthCm) {
+      stopSamuraiSession();
+      state.currentSession = null;
+      state.lastSamBbox = null;
+      state.lastDepthCm = null;
+      state.bboxHistory = [];
+      lastTrackingKeystateSig = '';
+      executeKeystate({});
+      renderTrackerStats(null);
+      ctx.clearRect(0, 0, $overlay.width, $overlay.height);
+
+      const planSid = ++state.sessionId;
+      const t1Sid = state.t1SessionId;
+      if (!t1Sid) {
+        // Shouldn't happen — every plan has a t1SessionId. Bail safely.
+        logConsole('err', 're-engage: no t1SessionId; ending plan');
+        setT1State('IDLE');
+        return;
+      }
+      setT1State('PLANNING', 're-engaging on stuck');
+      const text = `STATUS: my last go_to to "${sess.target}" got stuck. ` +
+        `Target was ${sess.targetDistanceCm}cm; depth plateaued at ${lastDepthCm}cm ` +
+        `(can't get closer — likely an obstacle or it's behind something). ` +
+        `Looking at the current frame, decide what to do next: settle here, ` +
+        `try go_to again at a more achievable distance, switch to follow, ` +
+        `or stop. One tool call.`;
+      logConsole('evt', `re-engage: ${text}`);
+
+      const frame = grabFrameJpegB64(0.85);
+      let r, data;
+      try {
+        r = await fetch('/api/t1', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ frame, text, session_id: t1Sid }),
+        });
+        data = await r.json();
+      } catch (err) {
+        logConsole('err', 're-engage fetch error: ' + err.message);
+        setT1State('IDLE');
+        state.t1SessionId = null;
+        return;
+      }
+      if (planSid !== state.sessionId) {
+        logConsole('evt', 're-engage response after cancel; dropping');
+        return;
+      }
+      if (!r.ok) {
+        logConsole('err', `re-engage T1 error: ${JSON.stringify(data)}`);
+        setT1State('IDLE');
+        state.t1SessionId = null;
+        return;
+      }
+      if (data.reasoning) logConsole('t1', `${data.source}: ${data.reasoning}`);
+      if (data.sonnet_reasoning) logConsole('t1', `sonnet (escalated): ${data.sonnet_reasoning}`);
+      if (!data.tools || data.tools.length === 0) {
+        logConsole('evt', `${data.source} chose no further action — plan complete`);
+        setT1State('IDLE');
+        return;
+      }
+      // Replace plan with whatever Sonnet decided. currentPlanSessionId is
+      // bumped to planSid so runNextStep doesn't bail thinking it's stale.
+      currentPlan = data.tools;
+      currentPlanIdx = 0;
+      currentPlanSessionId = planSid;
+      setT1State('EXECUTING');
+      runNextStep();
     }
 
     function onBboxLost() {
@@ -842,7 +930,7 @@
     // SECTION 8 — T1 dispatch + cancellation state machine
     // ===================================================================
     function cancelActiveSession(reason) {
-      if (state.t1State === 'IDLE' && !state.currentSession) return;
+      if (state.t1State === 'IDLE' && !state.currentSession && !state.t1SessionId) return;
       logConsole('evt', `cancel: ${reason}`);
       // Bumping sessionId invalidates all in-flight callbacks (vision +
       // SAMURAI bbox responses) because they check session id before acting.
@@ -854,6 +942,9 @@
       state.lastVisionBbox = null;
       state.bboxHistory = [];
       lastTrackingKeystateSig = '';
+      // Manual cancellation = "fresh start" intent. Drop the t1 session id so
+      // the next user submission opens a new conversation with Sonnet.
+      state.t1SessionId = null;
       // Emit a final keystate-zero to mirror user.html's "stop on cancel".
       executeKeystate({});
       setT1State('IDLE');
@@ -914,6 +1005,10 @@
 
         case 'stop':
           executeKeystate({});
+          // Sonnet's stop() ends the T1 conversation per spec — server has
+          // already dropped its half of the session record on this same call,
+          // so just clear the client side and the next user input gets fresh.
+          state.t1SessionId = null;
           setTimeout(() => runNextStep(), 50);
           break;
 
@@ -1010,12 +1105,16 @@
       logConsole('evt', `user: ${text}`);
 
       const planSid = ++state.sessionId;  // bump once for this whole plan
+      // cancelActiveSession just nulled t1SessionId — generate a fresh one
+      // so this plan opens a new server-side conversation that subsequent
+      // re-engages can continue.
+      state.t1SessionId = newT1SessionId();
       const frame = grabFrameJpegB64(0.85);
       try {
         const r = await fetch('/api/t1', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ frame, text }),
+          body: JSON.stringify({ frame, text, session_id: state.t1SessionId }),
         });
         const data = await r.json();
         $send.disabled = false;

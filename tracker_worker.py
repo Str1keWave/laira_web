@@ -69,6 +69,18 @@ CFG = "configs/samurai/sam2.1_hiera_b+.yaml"
 # ~24M params — ~30ms/frame on L4, comfortably within budget.
 DEPTH_MODEL_NAME = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
 
+# Depth Anything V2 has no input slot for camera intrinsics — at inference it
+# implicitly assumes the focal length / FoV the training set used (~60° hFoV
+# from the Hypersim renders). Real cameras with different FoV produce a
+# multiplicative bias on every reading: wider FoV → objects look smaller in
+# pixels → model overestimates distance. LaiRA's webcam is ~90° hFoV, so we
+# scale every reading down. Analytic correction:
+#     depth_corrected ≈ depth_raw * tan(θ_train/2) / tan(θ_real/2)
+#     ≈ depth_raw * tan(30°) / tan(45°) ≈ depth_raw * 0.577
+# Tune empirically by measuring against a known-distance object if 0.577
+# proves off — the constant is the only thing that needs to change.
+DEPTH_SCALE_CORRECTION = 0.577
+
 # Pruning windows. Sessions are unbounded in length; per-session memory is
 # bounded by these constants instead of by a hard frame cap.
 #
@@ -298,7 +310,7 @@ class TrackerService:
         median_m = float(np.median(masked))
         if not np.isfinite(median_m) or median_m <= 0:
             return None
-        return int(round(median_m * 100))
+        return int(round(median_m * 100 * DEPTH_SCALE_CORRECTION))
 
     # ---------- helpers ----------
     def _decode(self, b64_jpg: str):
