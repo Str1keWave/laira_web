@@ -564,10 +564,24 @@
       }
     }
 
+    // Pre-seed last-sent sig with all-zero so a stop() before any motion is a
+    // no-op. The Pi treats zero-keystates as "stand up" (user.html's stand
+    // command is just zero-keystates). So if the orchestrator emits stop()
+    // right after a lie_down/sit, we must NOT send the zero-keystate or
+    // LaiRA pops back upright. Dedupe handles this: lastKeystateSig starts
+    // as zero, so the first stop()'s zero is identical to "current" and
+    // gets skipped. Once she's actually moved, lastKeystateSig reflects that
+    // and a subsequent stop() correctly emits zero to halt the motion.
+    const ZERO_KEYSTATE_SIG = JSON.stringify({ w:'False', a:'False', s:'False', d:'False', q:'False', e:'False' });
+    let lastKeystateSig = ZERO_KEYSTATE_SIG;
+
     function executeKeystate(ks) {
       const full = { w:false, a:false, s:false, d:false, q:false, e:false, ...ks };
       const stringified = {};
       for (const k in full) stringified[k] = full[k] ? 'True' : 'False';
+      const sig = JSON.stringify(stringified);
+      if (sig === lastKeystateSig) return;
+      lastKeystateSig = sig;
       sendChatToPi({ keystates: stringified });
     }
 
