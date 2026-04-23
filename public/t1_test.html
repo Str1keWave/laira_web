@@ -661,11 +661,21 @@
     const DISTANCE_STABILITY_CM = 5;        // depth change <5cm = stable
     const STABILITY_CENTER_THRESHOLD = 10;  // 10px center change
     const STABILITY_FRAMES_ARRIVED = 3;
-    const STABILITY_FRAMES_STUCK = 10;
     const DISTANCE_TOL_CM = 8;              // arrived if depth <= target+TOL
     const FOLLOW_BAND_CM = 20;              // follow band around target
     const LOST_GRACE_MS = 2000;
     const HORIZ_DEADZONE_FRAC = 0.156;
+    // Stuck = haven't gotten meaningfully closer in a while AND we've been
+    // trying long enough that motor lag / initial acceleration shouldn't
+    // explain it. Time-based, not frame-count-based — robust to whatever
+    // SAMURAI's actual fps is, and gives motors a real window to engage.
+    // Tracks the best (lowest) depth ever seen during this approach; if it
+    // hasn't improved in STUCK_NO_PROGRESS_MS, that's stuck. Includes a
+    // floor MIN_ELAPSED so the very first few seconds can't trigger stuck
+    // even if depth is constant (which it always is in the test rig).
+    const STUCK_MIN_ELAPSED_MS  = 6000;     // must try at least 6s before declaring stuck
+    const STUCK_NO_PROGRESS_MS  = 5000;     // …AND best-depth hasn't improved in 5s
+    const PROGRESS_TOL_CM       = 5;        // depth must drop by ≥5cm to count as new "best"
 
     function pushBboxHistory(bbox, depthCm) {
       const [x, y, w, h] = bbox;
@@ -733,13 +743,27 @@
         }
         // arrived / stuck only meaningful for go_to.
         if (depthCm != null) {
+          // Update best-depth tracker. Initialize on first reading, then
+          // bump whenever we beat it by at least PROGRESS_TOL_CM (so depth
+          // noise doesn't keep "best" continuously refreshing).
+          if (sess.bestDepthCm == null) {
+            sess.bestDepthCm = depthCm;
+            sess.bestDepthAt = performance.now();
+          } else if (depthCm < sess.bestDepthCm - PROGRESS_TOL_CM) {
+            sess.bestDepthCm = depthCm;
+            sess.bestDepthAt = performance.now();
+          }
+
           const distStable = isDistanceStableForFrames(STABILITY_FRAMES_ARRIVED);
-          const distStableLong = isDistanceStableForFrames(STABILITY_FRAMES_STUCK);
           const centerStable = isCenterStableForFrames(STABILITY_FRAMES_ARRIVED);
           if (distStable && centerStable && depthCm <= target + DISTANCE_TOL_CM) {
             arrived = true;
-          } else if (distStableLong && depthCm > target + DISTANCE_TOL_CM) {
-            stuck = true;
+          } else if (depthCm > target + DISTANCE_TOL_CM) {
+            const elapsed = performance.now() - sess.startedAt;
+            const sinceProgress = performance.now() - sess.bestDepthAt;
+            if (elapsed >= STUCK_MIN_ELAPSED_MS && sinceProgress >= STUCK_NO_PROGRESS_MS) {
+              stuck = true;
+            }
           }
         }
       } else {
@@ -832,12 +856,16 @@
         return;
       }
       setT1State('PLANNING', 're-engaging on stuck');
+      const elapsedS = Math.round((performance.now() - sess.startedAt) / 1000);
+      const best = sess.bestDepthCm == null ? 'unknown' : `${sess.bestDepthCm}cm`;
       const text = `STATUS: my last go_to to "${sess.target}" got stuck. ` +
-        `Target was ${sess.targetDistanceCm}cm; depth plateaued at ${lastDepthCm}cm ` +
-        `(can't get closer — likely an obstacle or it's behind something). ` +
-        `Looking at the current frame, decide what to do next: settle here, ` +
-        `try go_to again at a more achievable distance, switch to follow, ` +
-        `or stop. One tool call.`;
+        `Target was ${sess.targetDistanceCm}cm; tried for ${elapsedS}s, ` +
+        `best depth achieved was ${best}, currently at ${lastDepthCm}cm and ` +
+        `not making further progress. Likely an obstacle, target moving away ` +
+        `at the same speed, or genuine unreachability. Looking at the current ` +
+        `frame, decide what to do next: settle here, try go_to again at a more ` +
+        `achievable distance, switch to follow (if target is moving), or stop. ` +
+        `One tool call.`;
       logConsole('evt', `re-engage: ${text}`);
 
       const frame = grabFrameJpegB64(0.85);
@@ -1074,6 +1102,8 @@
         target,
         targetDistanceCm,
         startedAt: performance.now(),
+        bestDepthCm: null,           // lowest depth ever seen this approach
+        bestDepthAt: 0,              // timestamp of bestDepthCm; for stuck check
       };
       renderTrackerStats({
         mode, target: targetDistanceCm, depthCm: null,
