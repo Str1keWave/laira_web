@@ -324,7 +324,7 @@
       const frameJpegB64 = grabFrameJpegB64(0.85);
       const W = $video.videoWidth, H = $video.videoHeight;
       try {
-        const resp = await fetch('/api/t1', {
+        const resp = await fetch('/api/vision', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ frame: frameJpegB64, message, width: W, height: H }),

@@ -1,0 +1,953 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>LaiRA T1 MVP — browser-cam orchestrator demo</title>
+  <!--
+    =========================================================================
+    LaiRA T1 MVP demo page.
+
+    Purpose: validate the full T1 orchestrator + SAMURAI motion-controller
+    loop end-to-end, WITHOUT actually sending anything to the Pi. The page
+    uses the browser's webcam as a stand-in for LaiRA's onboard camera, runs
+    the real T1 (server /api/t1 -> Sonnet/Opus + tools), runs the real
+    SAMURAI tracker on Modal for follow/go_to, derives the motion commands
+    that WOULD be sent to the Pi, and renders them as red overlay text on
+    the video instead of transmitting them.
+
+    What this validates:
+      - Tool routing (Sonnet vs. Opus escalation chain)
+      - Tool dispatch in the browser (sit/stand/lie_down/shake/stop fire-and-forget)
+      - Vision lookup -> SAMURAI session for follow/go_to
+      - bbox -> keystate motion controller
+      - "arrived" / "stuck" / "lost" termination for go_to
+      - Cancellation: manual input or new T1 input wipes any active session
+
+    What this does NOT validate:
+      - Actual Pi motor response to keystates (use user.html with real LaiRA)
+      - STT input pipeline (text box stands in for transcribed audio)
+      - On-device pre-classification (will live on Pi later)
+      - Long-horizon recovery (e.g. true loss -> spin and re-search)
+
+    Key design decisions baked in (re-evaluated at each step):
+
+    1. NO TALKBACK. The system prompts forbid LaiRA from generating speech
+       or asking the user questions. Only tool calls + debug-only reasoning.
+
+    2. Single-shot plans from Opus. No multi-turn reactivity for MVP. If a
+       step fails, the rest of the plan aborts and the failure is logged.
+
+    3. arrived(go_to) = centered AND area >= done_area_frac AND stable_for_3.
+       stuck   (go_to) = stable_for_10 AND area < done_area_frac.
+       lost   (either) = null bbox for >2s consecutive (~20 frames).
+       Stability check is essential: it prevents false-arrived from
+       Opus's done_area_frac estimate being too low.
+
+    4. follow() never terminates by itself. Holds a target distance =
+       0.5 * done_area_frac. Only ends on cancellation.
+
+    5. Manual input ALWAYS cancels active T1 session before executing.
+       Mirrors user.html semantics.
+
+    6. session_id counter on the client side dodges the race where a slow
+       /api/t1 response arrives after the user has already moved on. Stale
+       responses are dropped silently.
+
+    Critical assumptions to re-examine if behavior is wrong:
+      - Bbox area is a usable distance proxy. (Holds for ONE target with
+        consistent appearance. Falls apart if the target's apparent size
+        is being warped by occlusion or pose change.)
+      - Opus's done_area_frac estimate is in the right ballpark. (Shaky.
+        Mitigation: stuck-detection halts indefinitely-unreachable goals
+        rather than trying to march into them forever.)
+      - The horizontal deadzone (15.6% of width) and stability deltas
+        (5% area, 10px center) are tuned for ~10fps SAMURAI throughput.
+        If the rate changes substantially these need to be refit.
+      - SAMURAI's auto-reset is good enough that we don't need our own
+        loss-recovery in MVP. Confirmed by user testing on stream_test.
+
+    =========================================================================
+  -->
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    html, body { height: 100%; background: #121212; color: #e0e0e0; }
+    body { display: flex; flex-direction: column; align-items: center; }
+
+    h2 { margin: 12px 0 4px; font-size: 16px; color: #aaa; font-weight: 500; }
+    h2 .badge { background: #4f46e5; color: white; padding: 2px 8px;
+      border-radius: 4px; font-size: 11px; margin-left: 8px; vertical-align: middle; }
+
+    /* Component status bar at top */
+    #status-list {
+      display: grid; grid-template-columns: auto auto auto auto;
+      gap: 4px 14px; margin: 6px 0; font-size: 12px; color: #aaa;
+    }
+    #status-list .label { text-align: right; }
+    #status-list .value { display: flex; align-items: center; gap: 6px; }
+    #status-list .dot { display: inline-block; width: 9px; height: 9px;
+      border-radius: 50%; background: #555; }
+    .dot.ok   { background: #2ecc71; }
+    .dot.busy { background: #f1c40f; animation: pulse 1.4s infinite; }
+    .dot.err  { background: #e74c3c; }
+    @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.35 } }
+
+    /* Video stage */
+    #stage { position: relative; max-width: 100vw; margin-top: 4px; }
+    #video, #overlay { display: block; max-width: 100%; max-height: 55vh; }
+    #overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+
+    /* "Would-send to Pi" red overlay log — top-left of the video */
+    #would-send {
+      position: absolute; top: 8px; left: 8px;
+      background: rgba(0,0,0,0.55); padding: 6px 10px; border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; line-height: 1.4; color: #ff5252;
+      max-width: 60%; max-height: 40%; overflow-y: auto;
+      pointer-events: auto;
+    }
+    #would-send .head { color: #ff8a80; font-weight: 600; margin-bottom: 4px; }
+    #would-send .row  { color: #ff5252; }
+    #would-send .row .ts { color: #b06060; margin-right: 4px; }
+
+    /* SAMURAI legend — top-right */
+    #legend {
+      position: absolute; top: 8px; right: 8px;
+      background: rgba(0,0,0,0.55); padding: 6px 10px; border-radius: 4px;
+      font-size: 11px; line-height: 1.5;
+    }
+    .sw { display: inline-block; width: 10px; height: 10px;
+      vertical-align: middle; margin-right: 4px; }
+
+    /* T1 reasoning console */
+    #console {
+      width: min(900px, 92vw); margin: 8px auto 0;
+      background: #1c1c1c; border: 1px solid #333; border-radius: 6px;
+      padding: 8px 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; line-height: 1.5; color: #888;
+      max-height: 140px; overflow-y: auto;
+    }
+    #console .t1   { color: #b8c0ff; }      /* sonnet/opus reasoning */
+    #console .tool { color: #80cbc4; }       /* tool calls */
+    #console .evt  { color: #888; }          /* events */
+    #console .err  { color: #ff8a80; }       /* errors */
+    #console .ok   { color: #a5d6a7; }       /* successes */
+
+    /* T1 state badge */
+    #t1-state-row {
+      display: flex; gap: 12px; align-items: center; justify-content: center;
+      margin: 6px 0 4px; font-size: 12px; color: #aaa;
+    }
+    #t1-state {
+      padding: 2px 10px; border-radius: 9999px; font-weight: 600;
+      background: #444; color: #ddd;
+    }
+    #t1-state.IDLE      { background: #444; }
+    #t1-state.PLANNING  { background: #f1c40f; color: #222; }
+    #t1-state.EXECUTING { background: #4f46e5; color: white; }
+    #t1-state.TRACKING  { background: #2ecc71; color: #111; }
+
+    /* Bottom command bar */
+    #commandBar {
+      display: flex; gap: 8px; width: min(900px, 92vw); margin: 8px 0 6px;
+      background: #222; border-radius: 9999px; padding: 6px 10px;
+    }
+    #userMessage {
+      flex: 1; background: #000; border: none; outline: none; color: #e0e0e0;
+      font-size: 14px; padding: 8px 12px; border-radius: 9999px;
+    }
+    #sendBtn {
+      background: #4f46e5; border: none; color: white; font-weight: 600;
+      padding: 8px 16px; border-radius: 9999px; cursor: pointer;
+    }
+    #sendBtn:disabled { background: #555; cursor: not-allowed; }
+
+    /* Manual control buttons */
+    #manualButtons {
+      display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;
+      justify-content: center;
+    }
+    .manual-btn {
+      background: #333; border: none; color: #e0e0e0; padding: 6px 14px;
+      border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600;
+    }
+    .manual-btn:hover { background: #555; }
+  </style>
+</head>
+<body>
+  <h2>LaiRA T1 MVP <span class="badge">simulation only</span></h2>
+
+  <div id="status-list">
+    <div class="label">webcam</div>
+    <div class="value"><span class="dot" id="dot-camera"></span><span id="lbl-camera">off</span></div>
+    <div class="label">server config</div>
+    <div class="value"><span class="dot" id="dot-config"></span><span id="lbl-config">fetching…</span></div>
+    <div class="label">SAMURAI (Modal)</div>
+    <div class="value"><span class="dot" id="dot-modal"></span><span id="lbl-modal">checking…</span></div>
+    <div class="label">T1 endpoint</div>
+    <div class="value"><span class="dot" id="dot-t1"></span><span id="lbl-t1">unknown</span></div>
+  </div>
+
+  <div id="t1-state-row">
+    <span>T1 state:</span><span id="t1-state" class="IDLE">IDLE</span>
+    <span id="t1-action" style="color:#888"></span>
+  </div>
+
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+
+    <div id="would-send">
+      <div class="head">would send to Pi:</div>
+      <div id="would-send-rows"></div>
+    </div>
+
+    <div id="legend">
+      <div><span class="sw" style="background:#00aaff"></span>SAMURAI bbox</div>
+      <div><span class="sw" style="background:#f1c40f"></span>vision-found bbox (init)</div>
+    </div>
+  </div>
+
+  <div id="console"></div>
+
+  <div id="commandBar">
+    <input id="userMessage" placeholder='tell LaiRA what to do — e.g. "follow the person"'
+           autocomplete="off" />
+    <button id="sendBtn">Send</button>
+  </div>
+
+  <div id="manualButtons">
+    <button class="manual-btn" data-cmd="sit">Sit</button>
+    <button class="manual-btn" data-cmd="stand">Stand</button>
+    <button class="manual-btn" data-cmd="lie_down">Lie&nbsp;Down</button>
+    <button class="manual-btn" data-cmd="shake">Shake</button>
+    <button class="manual-btn" data-cmd="stop">Stop&nbsp;(cancel&nbsp;T1)</button>
+  </div>
+
+  <script>
+  (() => {
+    // ===================================================================
+    // SECTION 0 — DOM refs and state
+    // ===================================================================
+    const $video    = document.getElementById('video');
+    const $overlay  = document.getElementById('overlay');
+    const $send     = document.getElementById('sendBtn');
+    const $msg      = document.getElementById('userMessage');
+    const $console  = document.getElementById('console');
+    const $wouldRows= document.getElementById('would-send-rows');
+    const $t1State  = document.getElementById('t1-state');
+    const $t1Action = document.getElementById('t1-action');
+    const ctx       = $overlay.getContext('2d');
+
+    const components = { camera: 'busy', config: 'busy', modal: 'busy', t1: 'busy' };
+
+    // T1 + tracking state. session_id is the load-bearing race-guard.
+    const state = {
+      modalUrl: null,
+      ws: null,                        // WebSocket to SAMURAI
+      sessionId: 0,                    // counter; bumped on every new T1 invocation
+      currentSession: null,            // { id, mode, target, doneAreaFrac, ... }
+      t1State: 'IDLE',                 // IDLE | PLANNING | EXECUTING | TRACKING
+      lastSamBbox: null,
+      lastVisionBbox: null,
+      lastVisionAt: 0,
+      sentInFlight: false,             // SAMURAI WS back-pressure
+      // Sliding history for arrived/stuck detection — recent bbox stats.
+      bboxHistory: [],                 // [{frame_w, frame_h, x, y, w, h, t}]
+    };
+
+    function setComponent(name, status, label) {
+      components[name] = status;
+      const dot = document.getElementById('dot-' + name);
+      const lbl = document.getElementById('lbl-' + name);
+      if (dot) { dot.classList.remove('ok','busy','err'); dot.classList.add(status); }
+      if (lbl) lbl.textContent = label;
+    }
+
+    function setT1State(s, action='') {
+      state.t1State = s;
+      $t1State.textContent = s;
+      $t1State.className = s;
+      $t1Action.textContent = action ? `(${action})` : '';
+    }
+
+    function logConsole(cls, text) {
+      const row = document.createElement('div');
+      row.className = cls;
+      row.textContent = text;
+      $console.appendChild(row);
+      // Cap at ~50 rows so old reasoning rolls off.
+      while ($console.children.length > 50) $console.removeChild($console.firstChild);
+      $console.scrollTop = $console.scrollHeight;
+    }
+
+    function logWouldSend(payload) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const ts = new Date().toTimeString().slice(0, 8);
+      row.innerHTML = `<span class="ts">${ts}</span>${escapeHtml(JSON.stringify(payload))}`;
+      $wouldRows.appendChild(row);
+      // Cap at ~40 rows; we want recent-only context, not history.
+      while ($wouldRows.children.length > 40) $wouldRows.removeChild($wouldRows.firstChild);
+      $wouldRows.scrollTop = $wouldRows.scrollHeight;
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      }[c]));
+    }
+
+    // ===================================================================
+    // SECTION 1 — Webcam + canvas sizing
+    // ===================================================================
+    async function startWebcam() {
+      setComponent('camera', 'busy', 'requesting permission…');
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false,
+        });
+        $video.srcObject = stream;
+        await new Promise(r => $video.addEventListener('loadedmetadata', r, { once: true }));
+        $overlay.width = $video.videoWidth;
+        $overlay.height = $video.videoHeight;
+        setComponent('camera', 'ok', `live (${$video.videoWidth}×${$video.videoHeight})`);
+      } catch (err) {
+        setComponent('camera', 'err', 'blocked: ' + err.message);
+      }
+    }
+
+    // ===================================================================
+    // SECTION 2 — Server config (Modal URL) + Modal warmup + T1 sanity ping
+    // ===================================================================
+    async function loadConfig() {
+      setComponent('config', 'busy', 'fetching…');
+      try {
+        const resp = await fetch('/api/config');
+        const cfg = await resp.json();
+        if (!cfg.modalTrackerUrl) {
+          setComponent('config', 'err', 'MODAL_TRACKER_URL not set on server');
+          return;
+        }
+        state.modalUrl = cfg.modalTrackerUrl.replace(/\/+$/, '');
+        setComponent('config', 'ok', 'loaded');
+      } catch (err) {
+        setComponent('config', 'err', err.message);
+      }
+    }
+
+    async function prewarmModal() {
+      if (!state.modalUrl) { setComponent('modal', 'err', 'no URL'); return; }
+      setComponent('modal', 'busy', 'warming up (≤60s on cold start)…');
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 90000);
+      try {
+        const t0 = performance.now();
+        const r = await fetch(state.modalUrl + '/healthz', { signal: ctrl.signal });
+        clearTimeout(t);
+        if (!r.ok) { setComponent('modal', 'err', 'healthz http ' + r.status); return; }
+        setComponent('modal', 'ok', `ready (${Math.round(performance.now()-t0)}ms)`);
+      } catch (err) {
+        clearTimeout(t);
+        setComponent('modal', 'err', err.name === 'AbortError' ? 'timeout' : err.message);
+      }
+    }
+
+    // T1 sanity: just a HEAD-ish ping. We can't actually call /api/t1 without
+    // a frame, but we want to know if the endpoint exists. POST with garbage
+    // and check we get a 4xx (endpoint exists but rejects bad input) rather
+    // than a 404 (endpoint doesn't exist).
+    async function pingT1() {
+      setComponent('t1', 'busy', 'checking…');
+      try {
+        const r = await fetch('/api/t1', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        if (r.status === 400) {
+          setComponent('t1', 'ok', 'reachable');
+        } else if (r.status === 404) {
+          setComponent('t1', 'err', '404 — server not redeployed?');
+        } else {
+          setComponent('t1', 'ok', `reachable (http ${r.status})`);
+        }
+      } catch (err) {
+        setComponent('t1', 'err', err.message);
+      }
+    }
+
+    // ===================================================================
+    // SECTION 3 — Manual control mocks
+    // The Pi-bound JSON shapes are copied verbatim from user.html so the
+    // simulation is a faithful preview of what the real page sends.
+    // ===================================================================
+    const POSE_PAYLOADS = {
+      sit:      { angle: [[90,172,142],[90,200,50],[90,170,144],[90,200,50]] },
+      lie_down: { angle: [[90,200,135],[90,200,135],[90,200,135],[90,200,135]] },
+      shake:    { angle: [[90,200,113],[90,200,50],[90,170,144],[120,260,0]] },
+      // "stand" in user.html is just a keystate-zero, so we mirror that.
+      stand:    { keystates: { w:'False', a:'False', s:'False', d:'False', q:'False', e:'False' } },
+    };
+
+    function wouldSendChat(payload) {
+      // user.html wraps every command in {type:'chat-message', message: JSON.stringify(payload)}
+      logWouldSend({ type: 'chat-message', message: JSON.stringify(payload) });
+    }
+
+    function executePose(name) {
+      const p = POSE_PAYLOADS[name];
+      if (!p) { logConsole('err', `unknown pose: ${name}`); return; }
+      wouldSendChat(p);
+      // Multi-step poses (lie_down + 'rest' action; shake's full sequence)
+      // mimic user.html's setTimeout chains so timing previews accurately.
+      if (name === 'lie_down') {
+        setTimeout(() => wouldSendChat({ action: 'rest' }), 500);
+      } else if (name === 'shake') {
+        setTimeout(() => wouldSendChat({ angle: [[90,200,113],[90,240,100],[90,170,144],[120,260,0]] }), 500);
+        setTimeout(() => wouldSendChat({ action: 'shake' }), 1000);
+      }
+    }
+
+    function executeKeystate(ks) {
+      // ks is a partial { w?: bool, a?: bool, ... }; fill missing with false.
+      const full = { w:false, a:false, s:false, d:false, q:false, e:false, ...ks };
+      const stringified = {};
+      for (const k in full) stringified[k] = full[k] ? 'True' : 'False';
+      wouldSendChat({ keystates: stringified });
+    }
+
+    // Manual button handlers — each cancels any active T1 first.
+    document.querySelectorAll('.manual-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const cmd = btn.dataset.cmd;
+        cancelActiveSession('manual button');
+        if (cmd === 'stop') {
+          // stop is just cancel + zero-keystate.
+          executeKeystate({});
+          return;
+        }
+        executePose(cmd);
+      });
+    });
+
+    // WASD/QE keyboard — same cancel-and-show semantics as user.html.
+    const KEY_STATES = { w:false, a:false, s:false, d:false, q:false, e:false };
+    let lastKeystateSent = '';
+    document.addEventListener('keydown', e => {
+      // Don't intercept while typing in the message box.
+      if (document.activeElement === $msg) return;
+      const k = e.key.toLowerCase();
+      if (k === 'l') { cancelActiveSession('manual L key'); executePose('lie_down'); return; }
+      if (k in KEY_STATES) {
+        if (!KEY_STATES[k]) { cancelActiveSession('manual key: ' + k); KEY_STATES[k] = true; sendKeystatesIfChanged(); }
+      }
+    });
+    document.addEventListener('keyup', e => {
+      const k = e.key.toLowerCase();
+      if (k in KEY_STATES) { KEY_STATES[k] = false; sendKeystatesIfChanged(); }
+    });
+    function sendKeystatesIfChanged() {
+      const sig = JSON.stringify(KEY_STATES);
+      if (sig !== lastKeystateSent) {
+        lastKeystateSent = sig;
+        executeKeystate(KEY_STATES);
+      }
+    }
+
+    // ===================================================================
+    // SECTION 4 — Frame grab + vision call
+    // ===================================================================
+    function grabFrameJpegB64(quality=0.8) {
+      const c = document.createElement('canvas');
+      c.width = $video.videoWidth;
+      c.height = $video.videoHeight;
+      c.getContext('2d').drawImage($video, 0, 0);
+      return c.toDataURL('image/jpeg', quality).split(',', 2)[1];
+    }
+
+    async function callVision(target, purpose) {
+      const frame = grabFrameJpegB64(0.85);
+      const W = $video.videoWidth, H = $video.videoHeight;
+      const r = await fetch('/api/vision', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ frame, message: target, width: W, height: H, purpose }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(`vision ${r.status}: ${JSON.stringify(data)}`);
+      return data; // { bbox, done_area_frac, reasoning }
+    }
+
+    // ===================================================================
+    // SECTION 5 — SAMURAI session client
+    // Lifted from stream_test.html, adapted to the T1 lifecycle. Holds
+    // session_id so stale bbox responses can be filtered after cancel.
+    // ===================================================================
+    function openSamWs() {
+      return new Promise((resolve, reject) => {
+        const wsUrl = state.modalUrl.replace(/^http/, 'ws') + '/ws';
+        const ws = new WebSocket(wsUrl);
+        ws.onopen = () => resolve(ws);
+        ws.onerror = () => reject(new Error('SAMURAI ws error'));
+        ws.onmessage = e => onSamMessage(JSON.parse(e.data));
+        ws.onclose = () => { state.ws = null; };
+      });
+    }
+
+    async function ensureWs() {
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) return;
+      state.ws = await openSamWs();
+    }
+
+    function onSamMessage(msg) {
+      // session_id race-guard: if this message is for a stale session
+      // (the user has moved on), drop it silently.
+      const sess = state.currentSession;
+      if (!sess || msg.session_id !== sess.samuraiSessionId) return;
+
+      if (msg.type === 'init_ok') {
+        logConsole('ok', `SAMURAI init_ok (${JSON.stringify(msg.bbox)})`);
+        state.lastSamBbox = msg.bbox;
+        // Kick off the streaming loop now.
+        startSamuraiLoop();
+      } else if (msg.type === 'init_fail') {
+        logConsole('err', `SAMURAI init_fail: ${msg.error || ''}`);
+        finishSession('init_fail');
+      } else if (msg.type === 'bbox') {
+        state.sentInFlight = false;
+        state.lastSamBbox = msg.bbox;
+        if (msg.bbox) onBboxArrived(msg.bbox);
+        else onBboxLost();
+      } else if (msg.type === 'error') {
+        state.sentInFlight = false;
+        if (msg.error === 'no session') {
+          // Server forgot us (Modal cycled). Re-init from last bbox if we have one.
+          logConsole('evt', 'SAMURAI lost session, re-initing');
+          if (state.lastSamBbox) reinitSession();
+          else finishSession('session_lost');
+        }
+      }
+    }
+
+    async function reinitSession() {
+      const sess = state.currentSession; if (!sess) return;
+      const frame = grabFrameJpegB64(0.85);
+      const [x, y, w, h] = state.lastSamBbox;
+      sess.samuraiSessionId = 'sam-' + Math.random().toString(36).slice(2, 10);
+      state.ws.send(JSON.stringify({
+        type: 'init', session_id: sess.samuraiSessionId,
+        frame, bbox: [x, y, x+w, y+h],
+      }));
+    }
+
+    async function startSamuraiSession(initBbox) {
+      // initBbox is [x, y, w, h] from the vision call.
+      const sess = state.currentSession;
+      sess.samuraiSessionId = 'sam-' + Math.random().toString(36).slice(2, 10);
+      state.lastVisionBbox = initBbox;
+      state.lastVisionAt = performance.now();
+      state.bboxHistory = [];
+      state.lastSamBbox = initBbox;
+
+      await ensureWs();
+      const frame = grabFrameJpegB64(0.85);
+      const [x, y, w, h] = initBbox;
+      state.ws.send(JSON.stringify({
+        type: 'init', session_id: sess.samuraiSessionId,
+        frame, bbox: [x, y, x+w, y+h],
+      }));
+      // SAMURAI loop starts on init_ok.
+    }
+
+    function startSamuraiLoop() {
+      const sess = state.currentSession;
+      if (!sess) return;
+      sess.rafActive = true;
+      sess.lastSendTs = 0;
+      const tick = (t) => {
+        if (!sess.rafActive) return;
+        // Send-as-fast-as-possible with sentInFlight back-pressure.
+        if (!state.sentInFlight && state.ws && state.ws.readyState === WebSocket.OPEN) {
+          state.sentInFlight = true;
+          state.ws.send(JSON.stringify({
+            type: 'track', session_id: sess.samuraiSessionId,
+            frame: grabFrameJpegB64(0.7),
+          }));
+        }
+        drawOverlay();
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }
+
+    function stopSamuraiSession() {
+      const sess = state.currentSession;
+      if (sess) sess.rafActive = false;
+      if (state.ws && state.ws.readyState === WebSocket.OPEN && sess) {
+        try {
+          state.ws.send(JSON.stringify({ type: 'close', session_id: sess.samuraiSessionId }));
+        } catch (_) {}
+      }
+      state.sentInFlight = false;
+    }
+
+    // ===================================================================
+    // SECTION 6 — Motion controller + arrived/stuck/lost detectors
+    //
+    // Centering deadzone: 15.6% of frame width (matches user.html's
+    //   horizontalDeadzone=100/640). Outside deadzone -> turn keystate.
+    // Inside deadzone -> distance-based forward/back keystate.
+    //
+    // For go_to: walk forward until area_frac >= done_area_frac.
+    // For follow: hold target distance = 0.5 * done_area_frac (we follow
+    //   from further away than we go-to).
+    //
+    // History buffer tracks last ~12 frames (~1.2s @ 10fps) of bbox stats
+    // so we can compute stability without depending on absolute frame index.
+    // ===================================================================
+    const HISTORY_LEN = 12;
+    const STABILITY_AREA_THRESHOLD = 0.05;  // 5% relative area change
+    const STABILITY_CENTER_THRESHOLD = 10;  // 10px center change
+    const STABILITY_FRAMES_ARRIVED = 3;
+    const STABILITY_FRAMES_STUCK = 10;
+    const LOST_GRACE_MS = 2000;
+    const HORIZ_DEADZONE_FRAC = 0.156;
+
+    function pushBboxHistory(bbox) {
+      const W = $video.videoWidth, H = $video.videoHeight;
+      const [x, y, w, h] = bbox;
+      state.bboxHistory.push({ x, y, w, h, cx: x + w/2, area: w*h, t: performance.now() });
+      while (state.bboxHistory.length > HISTORY_LEN) state.bboxHistory.shift();
+    }
+
+    function isStableForFrames(n) {
+      // Relative area change AND absolute center change both stay under
+      // threshold for the most recent n frames.
+      if (state.bboxHistory.length < n) return false;
+      const recent = state.bboxHistory.slice(-n);
+      const baseArea = recent[0].area;
+      const baseCx = recent[0].cx;
+      for (const f of recent) {
+        if (Math.abs(f.area - baseArea) / Math.max(baseArea, 1) > STABILITY_AREA_THRESHOLD) return false;
+        if (Math.abs(f.cx - baseCx) > STABILITY_CENTER_THRESHOLD) return false;
+      }
+      return true;
+    }
+
+    function computeKeystatesAndStatus(bbox) {
+      // Returns { keystates, action, arrived, stuck }.
+      const sess = state.currentSession;
+      const W = $video.videoWidth, H = $video.videoHeight;
+      const [x, y, w, h] = bbox;
+      const cx = x + w/2;
+      const offset = cx - W/2;
+      const areaFrac = (w * h) / (W * H);
+      const ks = { w:false, a:false, s:false, d:false, q:false, e:false };
+      let action = 'tracking';
+      let arrived = false, stuck = false;
+
+      const horizDeadzone = W * HORIZ_DEADZONE_FRAC;
+
+      if (Math.abs(offset) > horizDeadzone) {
+        // Not centered yet — turn first, distance later.
+        if (offset > 0) { ks.d = true; action = 'turning right'; }
+        else            { ks.a = true; action = 'turning left'; }
+      } else if (sess.mode === 'go_to') {
+        // Centered. Walk forward until we hit done_area_frac.
+        if (areaFrac < sess.doneAreaFrac) {
+          ks.w = true; action = 'approaching';
+        } else {
+          action = 'centered, at distance';
+        }
+        // Arrived / stuck only meaningful for go_to.
+        const stableArrived = isStableForFrames(STABILITY_FRAMES_ARRIVED);
+        const stableStuck   = isStableForFrames(STABILITY_FRAMES_STUCK);
+        if (stableArrived && areaFrac >= sess.doneAreaFrac) arrived = true;
+        else if (stableStuck && areaFrac < sess.doneAreaFrac) stuck = true;
+      } else {
+        // follow mode: hold half the done size as a comfortable distance.
+        const targetFrac = sess.doneAreaFrac * 0.5;
+        const band = 0.05;
+        if (areaFrac < targetFrac - band)      { ks.w = true; action = 'closing distance'; }
+        else if (areaFrac > targetFrac + band) { ks.s = true; action = 'backing off'; }
+        else                                    { action = 'holding distance'; }
+      }
+      return { keystates: ks, action, arrived, stuck, areaFrac, offset };
+    }
+
+    let lastTrackingKeystateSig = '';
+
+    function onBboxArrived(bbox) {
+      const sess = state.currentSession;
+      if (!sess) return;
+      pushBboxHistory(bbox);
+      // Reset lost timer.
+      sess.lastBboxAt = performance.now();
+      const { keystates, action, arrived, stuck, areaFrac, offset } = computeKeystatesAndStatus(bbox);
+      setT1State('TRACKING', `${sess.mode}: ${sess.target} — ${action}`);
+      // Throttle would-send: only emit when keystates actually change. The
+      // Pi doesn't need 10Hz of identical messages; user.html sends every
+      // animation frame but the redundant ones are noise here.
+      const sig = JSON.stringify(keystates);
+      if (sig !== lastTrackingKeystateSig) {
+        lastTrackingKeystateSig = sig;
+        executeKeystate(keystates);
+      }
+      if (arrived) {
+        logConsole('ok', `arrived at "${sess.target}" (areaFrac=${areaFrac.toFixed(3)} >= ${sess.doneAreaFrac.toFixed(3)})`);
+        finishSession('arrived');
+      } else if (stuck) {
+        logConsole('err', `stuck approaching "${sess.target}" (areaFrac=${areaFrac.toFixed(3)} stable below ${sess.doneAreaFrac.toFixed(3)})`);
+        finishSession('stuck');
+      }
+    }
+
+    function onBboxLost() {
+      // SAMURAI emitted null bbox. Allow a grace window — could be a
+      // momentary occlusion, not a true loss.
+      const sess = state.currentSession; if (!sess) return;
+      const sinceLast = performance.now() - (sess.lastBboxAt || sess.startedAt);
+      if (sinceLast > LOST_GRACE_MS) {
+        logConsole('err', `lost "${sess.target}" (no bbox for ${Math.round(sinceLast)}ms)`);
+        finishSession('lost');
+      }
+      // While in grace: stop motion (zero keystates). Don't send the same
+      // zero-keystate message every frame though — just on the transition.
+      const sig = JSON.stringify({});
+      if (lastTrackingKeystateSig !== sig) {
+        lastTrackingKeystateSig = sig;
+        executeKeystate({});
+      }
+    }
+
+    // ===================================================================
+    // SECTION 7 — Overlay drawing
+    // ===================================================================
+    function drawOverlay() {
+      ctx.clearRect(0, 0, $overlay.width, $overlay.height);
+      if (state.lastSamBbox) {
+        const [x, y, w, h] = state.lastSamBbox;
+        ctx.strokeStyle = '#00aaff';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(x, y, w, h);
+      }
+      // Fade vision-found bbox after a few seconds (it's only meaningful
+      // at session start; once SAMURAI is tracking, that's what to look at).
+      if (state.lastVisionBbox && performance.now() - state.lastVisionAt < 4000) {
+        const [x, y, w, h] = state.lastVisionBbox;
+        ctx.strokeStyle = '#f1c40f';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 4]);
+        ctx.strokeRect(x, y, w, h);
+        ctx.setLineDash([]);
+      }
+    }
+
+    // ===================================================================
+    // SECTION 8 — T1 dispatch + cancellation state machine
+    // ===================================================================
+    function cancelActiveSession(reason) {
+      if (state.t1State === 'IDLE' && !state.currentSession) return;
+      logConsole('evt', `cancel: ${reason}`);
+      // Bumping sessionId invalidates all in-flight callbacks (vision +
+      // SAMURAI bbox responses) because they check session id before acting.
+      state.sessionId++;
+      stopSamuraiSession();
+      state.currentSession = null;
+      state.lastSamBbox = null;
+      state.lastVisionBbox = null;
+      state.bboxHistory = [];
+      lastTrackingKeystateSig = '';
+      // Emit a final keystate-zero to mirror user.html's "stop on cancel".
+      executeKeystate({});
+      setT1State('IDLE');
+      ctx.clearRect(0, 0, $overlay.width, $overlay.height);
+    }
+
+    function finishSession(reason) {
+      logConsole('evt', `session ended: ${reason}`);
+      stopSamuraiSession();
+      state.currentSession = null;
+      state.lastSamBbox = null;
+      state.bboxHistory = [];
+      lastTrackingKeystateSig = '';
+      executeKeystate({});
+      // Kick the plan forward.
+      runNextStep();
+    }
+
+    // Plan execution. Plans are an array of {tool, args}. We execute them
+    // sequentially; sit/stand/lie_down/shake/stop are immediate, follow/go_to
+    // are async (block until the SAMURAI session terminates).
+    let currentPlan = null;
+    let currentPlanIdx = 0;
+    let currentPlanSessionId = -1;
+
+    function runNextStep() {
+      if (!currentPlan || currentPlanSessionId !== state.sessionId) {
+        // Plan was canceled.
+        currentPlan = null;
+        setT1State('IDLE');
+        return;
+      }
+      if (currentPlanIdx >= currentPlan.length) {
+        currentPlan = null;
+        setT1State('IDLE');
+        logConsole('ok', 'plan complete');
+        return;
+      }
+      const step = currentPlan[currentPlanIdx++];
+      logConsole('tool', `> ${step.tool}(${JSON.stringify(step.args || {})})`);
+      executeTool(step.tool, step.args || {});
+    }
+
+    function executeTool(tool, args) {
+      switch (tool) {
+        case 'sit':
+        case 'stand':
+        case 'lie_down':
+        case 'shake':
+          executePose(tool);
+          // Pose tools complete after their longest setTimeout. Schedule
+          // runNextStep right after (1100ms covers shake's ~1s sequence).
+          setTimeout(() => runNextStep(), 1100);
+          break;
+
+        case 'stop':
+          executeKeystate({});
+          setTimeout(() => runNextStep(), 50);
+          break;
+
+        case 'drive': {
+          // Opus-only. direction -> keystate map. Cap duration defensively
+          // even though server validates schema.
+          const DIR_MAP = {
+            forward: { w: true }, back: { s: true },
+            left: { a: true },    right: { d: true },
+            rotate_left:  { q: true }, rotate_right: { e: true },
+          };
+          const ks = DIR_MAP[args.direction];
+          if (!ks) { logConsole('err', `bad direction: ${args.direction}`); runNextStep(); return; }
+          const dur = Math.min(3000, Math.max(100, args.duration_ms || 500));
+          executeKeystate(ks);
+          setTimeout(() => { executeKeystate({}); setTimeout(() => runNextStep(), 50); }, dur);
+          break;
+        }
+
+        case 'follow':
+        case 'go_to':
+          startVisionThenTrack(tool, args.target);
+          break;
+
+        default:
+          logConsole('err', `unknown tool: ${tool}`);
+          runNextStep();
+      }
+    }
+
+    async function startVisionThenTrack(mode, target) {
+      const planSid = state.sessionId;
+      setT1State('EXECUTING', `${mode}: ${target} (vision lookup)`);
+      let visionResult;
+      try {
+        visionResult = await callVision(target, mode);
+      } catch (err) {
+        logConsole('err', `vision failed: ${err.message}`);
+        runNextStep();
+        return;
+      }
+      if (planSid !== state.sessionId) return; // canceled mid-call
+      if (!visionResult.bbox) {
+        logConsole('err', `vision could not find "${target}": ${visionResult.reasoning || ''}`);
+        runNextStep();
+        return;
+      }
+      logConsole('t1', `vision: ${visionResult.reasoning || ''} done_area_frac=${visionResult.done_area_frac}`);
+      const [x1, y1, x2, y2] = visionResult.bbox;
+      const initBbox = [x1, y1, x2 - x1, y2 - y1];
+      state.lastVisionBbox = initBbox;
+      state.lastVisionAt = performance.now();
+      state.currentSession = {
+        id: planSid,
+        mode,
+        target,
+        doneAreaFrac: visionResult.done_area_frac || 0.30,
+        startedAt: performance.now(),
+      };
+      setT1State('EXECUTING', `${mode}: ${target} (opening SAMURAI)`);
+      try {
+        await startSamuraiSession(initBbox);
+      } catch (err) {
+        logConsole('err', `SAMURAI open failed: ${err.message}`);
+        finishSession('samurai_open_failed');
+      }
+      // From here, lifecycle is event-driven: bbox messages arrive ->
+      // computeKeystatesAndStatus -> arrived/stuck/lost -> finishSession ->
+      // runNextStep.
+    }
+
+    // ===================================================================
+    // SECTION 9 — Submit handler (the entry point for new T1 commands)
+    // ===================================================================
+    async function onSubmit() {
+      const text = $msg.value.trim();
+      if (!text) return;
+      // Cancel anything in flight before starting.
+      cancelActiveSession('new T1 input');
+      $msg.value = '';
+      $send.disabled = true;
+      setT1State('PLANNING');
+      logConsole('evt', `user: ${text}`);
+
+      const planSid = ++state.sessionId;  // bump once for this whole plan
+      const frame = grabFrameJpegB64(0.85);
+      try {
+        const r = await fetch('/api/t1', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ frame, text }),
+        });
+        const data = await r.json();
+        $send.disabled = false;
+        if (planSid !== state.sessionId) {
+          logConsole('evt', 'T1 response arrived after cancel; dropping');
+          return;
+        }
+        if (!r.ok) {
+          logConsole('err', `T1 error: ${JSON.stringify(data)}`);
+          setT1State('IDLE');
+          return;
+        }
+        if (data.reasoning) logConsole('t1', `${data.source}: ${data.reasoning}`);
+        if (data.sonnet_reasoning) logConsole('t1', `sonnet (escalated): ${data.sonnet_reasoning}`);
+        if (!data.tools || data.tools.length === 0) {
+          logConsole('evt', `${data.source} chose no action — LaiRA does nothing`);
+          setT1State('IDLE');
+          return;
+        }
+        currentPlan = data.tools;
+        currentPlanIdx = 0;
+        currentPlanSessionId = planSid;
+        setT1State('EXECUTING');
+        runNextStep();
+      } catch (err) {
+        $send.disabled = false;
+        logConsole('err', 'T1 fetch error: ' + err.message);
+        setT1State('IDLE');
+      }
+    }
+    $send.addEventListener('click', onSubmit);
+    $msg.addEventListener('keydown', e => { if (e.key === 'Enter') onSubmit(); });
+
+    // ===================================================================
+    // SECTION 10 — Bootstrap
+    // ===================================================================
+    startWebcam();
+    loadConfig().then(prewarmModal);
+    pingT1();
+  })();
+  </script>
+</body>
+</html>
