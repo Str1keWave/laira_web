@@ -180,6 +180,20 @@ const SHARED_TOOLS = [
     description: 'Cancel any active task and stand still. Use for: stop, halt, freeze, never mind, cancel that.',
     input_schema: { type: 'object', properties: {}, required: [] },
   },
+  {
+    name: 'wait',
+    description: 'Pause for duration_ms milliseconds before the next action. Use for pacing within a compound plan ("sit, then stand a couple seconds later" -> sit, wait(2000), stand) or when the user explicitly asks to wait. Hard cap is 30000ms; for longer idle the user should re-trigger LaiRA. The wait is interrupted immediately by stop, by manual user input, or by the user issuing a new command.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        duration_ms: {
+          type: 'integer', minimum: 100, maximum: 30000,
+          description: 'Milliseconds to pause. Reference: 1500-3000 a beat between actions, 5000-10000 a noticeable wait, 10000+ a long deliberate pause.',
+        },
+      },
+      required: ['duration_ms'],
+    },
+  },
 ];
 
 const SONNET_TOOLS = [
@@ -237,7 +251,7 @@ const OPUS_SYSTEM = [
   '',
   'You are the orchestrator for LaiRA. You were called because the request was too complex for the first-line router. Plan the entire sequence of tool calls UPFRONT in one response. You will NOT get a chance to react to results — tools execute fire-and-forget, and any failure aborts the rest of the plan.',
   'Be conservative. If a step is risky or you\'re uncertain it will work, omit it. Better to do less correctly than more half-done.',
-  'You can issue multiple tool calls in your single response. They execute in order. Each tool blocks until complete (e.g. go_to() blocks until LaiRA arrives or gives up). Plan accordingly: after a successful go_to(green ball, 15), you can chain a sit() because you know LaiRA will be standing right next to it.',
+  'You can issue multiple tool calls in your single response. They execute in order. Each tool blocks until complete (e.g. go_to() blocks until LaiRA arrives or gives up). Plan accordingly: after a successful go_to(green ball, 15), you can chain a sit() because you know LaiRA will be standing right next to it. For pacing ("sit, then stand a moment later"), use wait(duration_ms) between the two actions.',
   'For follow / go_to you must pick target_distance_cm (5-300). Reference: 10-20 nose-to-target, 30-60 body-distance to a person/dog, 80-150 room-scale. Choose what fits the user\'s actual intent.',
   'You have a drive() tool the first-line router does not. Use it for "turn around", "back up", "explore" type intents.',
 ].join('\n');

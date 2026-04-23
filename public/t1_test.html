@@ -1082,8 +1082,14 @@ function computeKeystatesAndStatus(bbox, depthCm) {
     // SECTION 8 — T1 dispatch + cancellation state machine
     // ===================================================================
     function cancelActiveSession(reason) {
-      if (state.t1State === 'IDLE' && !state.currentSession && !state.t1SessionId) return;
+      if (state.t1State === 'IDLE' && !state.currentSession && !state.t1SessionId && activeWaitTimer == null) return;
       logConsole('evt', `cancel: ${reason}`);
+      // Kill any pending wait() so a paused plan terminates immediately
+      // rather than firing the next step seconds after the user moved on.
+      if (activeWaitTimer != null) {
+        clearTimeout(activeWaitTimer);
+        activeWaitTimer = null;
+      }
       // Bumping sessionId invalidates all in-flight callbacks (vision +
       // SAMURAI bbox responses) because they check session id before acting.
       state.sessionId++;
@@ -1135,6 +1141,10 @@ function computeKeystatesAndStatus(bbox, depthCm) {
     // Set by finishSession (for go_to/follow), the pose-tool callback, and
     // the drive-tool callback.
     let lastStepResult = null;
+    // Active wait()'s setTimeout id, so cancelActiveSession (and any other
+    // hard interrupt) can immediately abort an in-progress wait. null when
+    // no wait is pending.
+    let activeWaitTimer = null;
 
     function runNextStep() {
       if (!currentPlan || currentPlanSessionId !== state.sessionId) {
@@ -1176,6 +1186,22 @@ function computeKeystatesAndStatus(bbox, depthCm) {
           state.t1SessionId = null;
           setTimeout(() => runNextStep(), 50);
           break;
+
+        case 'wait': {
+          // Pace between actions in a compound plan. Cancellable: any
+          // cancelActiveSession (manual stop button, manual key, new T1
+          // input) will clearTimeout this and the runNextStep tick will
+          // never run. If it does run after a cancel, runNextStep's own
+          // session-id check bails it out safely.
+          const ms = Math.min(30000, Math.max(100, args.duration_ms || 1000));
+          if (activeWaitTimer != null) clearTimeout(activeWaitTimer);
+          activeWaitTimer = setTimeout(() => {
+            activeWaitTimer = null;
+            lastStepResult = `wait(${ms}ms) completed`;
+            runNextStep();
+          }, ms);
+          break;
+        }
 
         case 'drive': {
           // Opus-only. direction -> keystate map. Cap duration defensively
