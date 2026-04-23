@@ -514,7 +514,12 @@
       });
       const data = await r.json();
       if (!r.ok) throw new Error(`vision ${r.status}: ${JSON.stringify(data)}`);
-      return data; // { bbox, done_area_frac, reasoning }
+      // Return the frame too so the caller can use it for SAMURAI init —
+      // bbox is derived from THIS frame, so init must pair them or SAMURAI
+      // locks onto whatever's at those coordinates in a newer frame (which
+      // is usually wrong because the user has moved during the LLM call).
+      data.frame = frame;
+      return data; // { bbox, done_area_frac, reasoning, frame }
     }
 
     // ===================================================================
@@ -584,8 +589,11 @@
       }));
     }
 
-    async function startSamuraiSession(initBbox) {
-      // initBbox is [x, y, w, h] from the vision call.
+    async function startSamuraiSession(initBbox, initFrame) {
+      // initBbox is [x, y, w, h]. initFrame is the b64 JPEG that the bbox
+      // was derived from — passed in by callers that have a coherent pair
+      // (e.g. vision result). If absent (e.g. SAMURAI session reinit) we
+      // grab fresh, accepting the small risk that the bbox is stale.
       const sess = state.currentSession;
       sess.samuraiSessionId = 'sam-' + Math.random().toString(36).slice(2, 10);
       state.lastVisionBbox = initBbox;
@@ -594,7 +602,7 @@
       state.lastSamBbox = initBbox;
 
       await ensureWs();
-      const frame = grabFrameJpegB64(0.85);
+      const frame = initFrame || grabFrameJpegB64(0.85);
       const [x, y, w, h] = initBbox;
       state.ws.send(JSON.stringify({
         type: 'init', session_id: sess.samuraiSessionId,
@@ -956,6 +964,75 @@ function computeKeystatesAndStatus(bbox, depthCm) {
       runNextStep();
     }
 
+    // Called from runNextStep when the current plan exhausts. Sonnet tends to
+    // emit one tool per turn even for compound user requests (e.g. for "come
+    // to me, shake" she returns just [go_to] and mentions shake only in her
+    // reasoning). Without a continuation round-trip, the trailing actions are
+    // silently dropped on plan exhaustion. So instead of declaring "plan
+    // complete," we ask Sonnet what to do next; her session memory holds the
+    // original user request and her own prior plan, so she can issue the
+    // remaining action(s) or call stop() if the request is satisfied.
+    //
+    // No continuation if t1SessionId is null — that means stop() ran during
+    // this plan, or the user manually canceled. Either way the conversation
+    // is dead and we go IDLE.
+    async function continuePlan(stepResult) {
+      // Distinct log so we can prove this function was even reached vs.
+      // old-build runNextStep logging "plan complete" itself.
+      logConsole('evt', `continuePlan entry (t1Sid=${state.t1SessionId ? 'set' : 'null'}, last=${stepResult})`);
+      const planSid = ++state.sessionId;
+      const t1Sid = state.t1SessionId;
+      if (!t1Sid) {
+        setT1State('IDLE');
+        logConsole('ok', 'plan complete (no t1 session — early exit)');
+        return;
+      }
+      setT1State('PLANNING', 'continuing plan');
+      const text = `STATUS: previous step finished — ${stepResult}. Looking at ` +
+        `the current frame and the original user request, decide your next ` +
+        `tool to continue, or call stop() if the user's request is now fully ` +
+        `satisfied. One tool call.`;
+      logConsole('evt', `continue: ${stepResult}`);
+
+      const frame = grabFrameJpegB64(0.85);
+      let r, data;
+      try {
+        r = await fetch('/api/t1', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ frame, text, session_id: t1Sid }),
+        });
+        data = await r.json();
+      } catch (err) {
+        logConsole('err', 'continue fetch error: ' + err.message);
+        setT1State('IDLE');
+        state.t1SessionId = null;
+        return;
+      }
+      if (planSid !== state.sessionId) {
+        logConsole('evt', 'continue response after cancel; dropping');
+        return;
+      }
+      if (!r.ok) {
+        logConsole('err', `continue T1 error: ${JSON.stringify(data)}`);
+        setT1State('IDLE');
+        state.t1SessionId = null;
+        return;
+      }
+      if (data.reasoning) logConsole('t1', `${data.source}: ${data.reasoning}`);
+      if (data.sonnet_reasoning) logConsole('t1', `sonnet (escalated): ${data.sonnet_reasoning}`);
+      if (!data.tools || data.tools.length === 0) {
+        logConsole('ok', 'plan complete');
+        setT1State('IDLE');
+        return;
+      }
+      currentPlan = data.tools;
+      currentPlanIdx = 0;
+      currentPlanSessionId = planSid;
+      setT1State('EXECUTING');
+      runNextStep();
+    }
+
     function onBboxLost() {
       // SAMURAI emitted null bbox. Allow a grace window — could be a
       // momentary occlusion, not a true loss.
@@ -1029,6 +1106,12 @@ function computeKeystatesAndStatus(bbox, depthCm) {
 
     function finishSession(reason) {
       logConsole('evt', `session ended: ${reason}`);
+      // Record outcome for continuePlan, before we null out the session.
+      const sess = state.currentSession;
+      if (sess) {
+        const dist = state.lastDepthCm == null ? '' : ` at depth=${state.lastDepthCm}cm`;
+        lastStepResult = `${sess.mode}("${sess.target}") ${reason}${dist}`;
+      }
       stopSamuraiSession();
       state.currentSession = null;
       state.lastSamBbox = null;
@@ -1047,6 +1130,11 @@ function computeKeystatesAndStatus(bbox, depthCm) {
     let currentPlan = null;
     let currentPlanIdx = 0;
     let currentPlanSessionId = -1;
+    // Description of the most recently completed step. Read by continuePlan
+    // to tell Sonnet what just happened so she can decide what to do next.
+    // Set by finishSession (for go_to/follow), the pose-tool callback, and
+    // the drive-tool callback.
+    let lastStepResult = null;
 
     function runNextStep() {
       if (!currentPlan || currentPlanSessionId !== state.sessionId) {
@@ -1057,8 +1145,10 @@ function computeKeystatesAndStatus(bbox, depthCm) {
       }
       if (currentPlanIdx >= currentPlan.length) {
         currentPlan = null;
-        setT1State('IDLE');
-        logConsole('ok', 'plan complete');
+        // Don't declare done — round-trip Sonnet to see if there's more to do.
+        // continuePlan handles the no-t1SessionId case (stop() ran or canceled)
+        // by going IDLE without making a server call.
+        continuePlan(lastStepResult || 'previous step completed');
         return;
       }
       const step = currentPlan[currentPlanIdx++];
@@ -1075,7 +1165,7 @@ function computeKeystatesAndStatus(bbox, depthCm) {
           executePose(tool);
           // Pose tools complete after their longest setTimeout. Schedule
           // runNextStep right after (1100ms covers shake's ~1s sequence).
-          setTimeout(() => runNextStep(), 1100);
+          setTimeout(() => { lastStepResult = `${tool}() completed`; runNextStep(); }, 1100);
           break;
 
         case 'stop':
@@ -1102,7 +1192,11 @@ function computeKeystatesAndStatus(bbox, depthCm) {
           if (!ks) { logConsole('err', `bad direction: ${args.direction}`); runNextStep(); return; }
           const dur = Math.min(3000, Math.max(100, args.duration_ms || 500));
           executeKeystate(ks);
-          setTimeout(() => { executeKeystate({}); setTimeout(() => runNextStep(), 50); }, dur);
+          setTimeout(() => {
+            executeKeystate({});
+            lastStepResult = `drive(${args.direction}, ${dur}ms) completed`;
+            setTimeout(() => runNextStep(), 50);
+          }, dur);
           break;
         }
 
@@ -1162,7 +1256,12 @@ function computeKeystatesAndStatus(bbox, depthCm) {
       });
       setT1State('EXECUTING', `${mode}: ${target} @${targetDistanceCm}cm (opening SAMURAI)`);
       try {
-        await startSamuraiSession(initBbox);
+        // Pass the vision frame so SAMURAI inits with a frame+bbox pair
+        // taken at the same instant. Without this, init uses a fresh frame
+        // (now seconds newer because of the LLM round-trip) plus the old
+        // bbox, and SAMURAI locks on whatever happens to be at those
+        // coordinates in the new frame — usually the wrong region.
+        await startSamuraiSession(initBbox, visionResult.frame);
       } catch (err) {
         logConsole('err', `SAMURAI open failed: ${err.message}`);
         finishSession('samurai_open_failed');
@@ -1233,7 +1332,15 @@ function computeKeystatesAndStatus(bbox, depthCm) {
     // SECTION 10 — Bootstrap
     // ===================================================================
     startWebcam();
-    loadConfig().then(prewarmModal);
+    // After Modal healthz returns, pre-open the SAMURAI WebSocket so the
+    // first go_to/follow doesn't pay the TLS+WS handshake (~200-500ms)
+    // right when the user is waiting for tracking to start. ensureWs is
+    // idempotent and the lazy reopen path still handles Modal idle-closing
+    // the connection later.
+    loadConfig()
+      .then(prewarmModal)
+      .then(() => ensureWs().catch(err =>
+        logConsole('err', 'WS pre-warm failed: ' + err.message)));
     pingT1();
   })();
   </script>
