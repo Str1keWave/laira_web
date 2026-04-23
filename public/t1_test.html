@@ -1208,10 +1208,11 @@ function computeKeystatesAndStatus(bbox, depthCm) {
           // even though server validates schema.
           // a/d are LaiRA's turn keystates — there's no strafe (quadruped
           // dogs don't translate sideways). q/e are unused on the Pi side,
-          // so rotate_* MUST map to a/d, not q/e.
+          // so rotate_* MUST map to a/d, not q/e. Server-side drive schema
+          // exposes only forward/back/rotate_left/rotate_right — no
+          // left/right translation, since this dog can't strafe.
           const DIR_MAP = {
             forward: { w: true }, back: { s: true },
-            left: { a: true },    right: { d: true },
             rotate_left:  { a: true }, rotate_right: { d: true },
           };
           const ks = DIR_MAP[args.direction];

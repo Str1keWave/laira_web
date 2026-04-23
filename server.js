@@ -209,11 +209,11 @@ const OPUS_TOOLS = [
   ...SHARED_TOOLS,
   {
     name: 'drive',
-    description: 'Send a single low-level movement command. Used for non-tracking-based movement like "back up a bit", "turn around", "spin in place". Direction: forward/back/left/right (translation), or rotate_left/rotate_right (turn in place). duration_ms is hard-capped at 3000.',
+    description: 'Send a single low-level movement command. Used for non-tracking-based movement like "back up a bit", "turn around", "spin in place". Direction: forward / back (translation), or rotate_left / rotate_right (turn in place). LaiRA is a quadruped — she does not strafe; sideways movement is achieved by rotating then driving forward. duration_ms is hard-capped at 3000ms (do not trust longer blind motion — that\'s what the tracker is for).',
     input_schema: {
       type: 'object',
       properties: {
-        direction: { type: 'string', enum: ['forward', 'back', 'left', 'right', 'rotate_left', 'rotate_right'] },
+        direction: { type: 'string', enum: ['forward', 'back', 'rotate_left', 'rotate_right'] },
         duration_ms: { type: 'integer', minimum: 100, maximum: 3000 },
       },
       required: ['direction', 'duration_ms'],
@@ -253,7 +253,11 @@ const OPUS_SYSTEM = [
   'Be conservative. If a step is risky or you\'re uncertain it will work, omit it. Better to do less correctly than more half-done.',
   'You can issue multiple tool calls in your single response. They execute in order. Each tool blocks until complete (e.g. go_to() blocks until LaiRA arrives or gives up). Plan accordingly: after a successful go_to(green ball, 15), you can chain a sit() because you know LaiRA will be standing right next to it. For pacing ("sit, then stand a moment later"), use wait(duration_ms) between the two actions.',
   'For follow / go_to you must pick target_distance_cm (5-300). Reference: 10-20 nose-to-target, 30-60 body-distance to a person/dog, 80-150 room-scale. Choose what fits the user\'s actual intent.',
-  'You have a drive() tool the first-line router does not. Use it for "turn around", "back up", "explore" type intents.',
+  'You have a drive() tool the first-line router does not. Use it for "turn around", "back up", "explore" type intents. Note: LaiRA cannot strafe — there is no left/right translation, only forward/back and rotate_left/rotate_right. To "move sideways" you rotate then drive forward.',
+  '',
+  'Camera frames in your message history are labeled "[frame X of N — ...]". The CURRENT frame (highest index, marked CURRENT) is the just-captured one. Earlier frames in the same session are kept so you remember spatial context from when the task started — for example, if the user pointed somewhere in the original frame, that gesture won\'t be in the current frame but you can refer back to it. Older frames beyond the rolling window are omitted to save tokens.',
+  '',
+  'After go_to(target) arrives, if the user wanted LaiRA to stay there ("go wait by X", "go to Y and stay", "park there"), call stop() — LaiRA will stand still until told otherwise. Do NOT use wait() for indefinite stays: it\'s capped at 30s and is intended for short pacing between actions, not for parking.',
 ].join('\n');
 
 // --- Helpers -----------------------------------------------------------
@@ -330,6 +334,11 @@ async function callAnthropic(model, system, tools, messages) {
 //     fine to the model and is correctly formatted.
 const T1_SESSIONS = new Map();
 const T1_SESSION_TTL_MS = 10 * 60 * 1000;
+// Keep at most this many most-recent user turns' frames intact in the message
+// history. Older user turns get their image blocks stripped to a text marker.
+// 10 is well above any realistic compound plan turn count — it's a safety cap,
+// not a normal operating point.
+const MAX_FRAMES_IN_HISTORY = 10;
 
 function pruneT1Sessions() {
   const now = Date.now();
@@ -342,6 +351,59 @@ function stripFramesFromUserContent(content) {
   return content.map(b => b.type === 'image'
     ? { type: 'text', text: '[prior camera frame omitted]' }
     : b);
+}
+
+// Walk the full user-turn list (priorMessages + the current user turn) and
+// build a fresh messages[] for the API call. We keep image content in the
+// most recent MAX_FRAMES_IN_HISTORY user turns, and label each kept frame
+// with its position so Opus knows which one is "now" and which is "the
+// original frame from when the task started". Older user turns get their
+// images stripped to a text marker.
+//
+// Note: this only mutates content in-flight for the API call; what we
+// store in T1_SESSIONS keeps frames intact so subsequent turns can re-decide
+// what to keep based on the new MAX window.
+function buildCallMessages(priorMessages, currentUserContent) {
+  const allMessages = [...priorMessages, { role: 'user', content: currentUserContent }];
+  // Find indices of user turns that contain at least one image block.
+  const imageTurnIndices = [];
+  for (let i = 0; i < allMessages.length; i++) {
+    const m = allMessages[i];
+    if (m.role !== 'user' || !Array.isArray(m.content)) continue;
+    if (m.content.some(b => b && b.type === 'image')) {
+      imageTurnIndices.push(i);
+    }
+  }
+  const keepCount = Math.min(imageTurnIndices.length, MAX_FRAMES_IN_HISTORY);
+  const keepStart = imageTurnIndices.length - keepCount; // index into imageTurnIndices
+  const keptIndices = new Set(imageTurnIndices.slice(keepStart));
+
+  return allMessages.map((m, i) => {
+    if (m.role !== 'user' || !Array.isArray(m.content)) return m;
+    const hasImage = m.content.some(b => b && b.type === 'image');
+    if (!hasImage) return m;
+    if (!keptIndices.has(i)) {
+      return { role: 'user', content: stripFramesFromUserContent(m.content) };
+    }
+    // This is one of the kept turns — figure out its position label.
+    const positionInWindow = imageTurnIndices.slice(keepStart).indexOf(i) + 1; // 1-based
+    const isCurrent = positionInWindow === keepCount;
+    const isOldest = positionInWindow === 1 && keepCount > 1;
+    const label = isCurrent
+      ? `[frame ${positionInWindow} of ${keepCount} — CURRENT (just captured)]`
+      : isOldest
+        ? `[frame ${positionInWindow} of ${keepCount} — oldest in window, from when this part of the conversation started]`
+        : `[frame ${positionInWindow} of ${keepCount}]`;
+    // Insert the label as a text block right before each image block.
+    const labeled = [];
+    for (const b of m.content) {
+      if (b && b.type === 'image') {
+        labeled.push({ type: 'text', text: label });
+      }
+      labeled.push(b);
+    }
+    return { role: 'user', content: labeled };
+  });
 }
 
 function summarizeAssistantTurn(toolList, reasoning) {
@@ -370,23 +432,18 @@ app.post('/api/t1', async (req, res) => {
     // Pull prior conversation history if the client is continuing a session.
     const sessRecord = session_id ? T1_SESSIONS.get(session_id) : null;
     const priorMessages = sessRecord ? sessRecord.messages : [];
-    const messagesForCall = [...priorMessages, { role: 'user', content: userContent }];
-
-    // Tier 1: Sonnet
-    const sonnetPayload = await callAnthropic(
-      'claude-sonnet-4-6', SONNET_SYSTEM, SONNET_TOOLS, messagesForCall
-    );
-    const sonnetResult = extractToolCalls(sonnetPayload, VALID_SONNET_TOOL_NAMES);
-
-    // Did Sonnet escalate? If yes, chain to Opus with the SAME user input.
-    // Per the user's spec, escalate carries no args — Opus re-plans from
-    // the raw utterance + frame (and the same prior history). Cleaner than
-    // relaying Sonnet's partial reasoning.
-    const escalated = sonnetResult.tools.some(t => t.tool === 'escalate');
+    // Sticky escalation: once Opus has been engaged for a session, every
+    // subsequent turn in that session goes straight to Opus. Sonnet was
+    // routed past on this conversation already, no point re-routing.
+    const escalatedSticky = !!(sessRecord && sessRecord.escalated);
+    const messagesForCall = buildCallMessages(priorMessages, userContent);
 
     let finalSource, finalReasoning, finalTools;
     let extraSonnetReasoning;
-    if (escalated) {
+    let escalated = false;
+
+    if (escalatedSticky) {
+      // Skip the router entirely — go straight to Opus.
       const opusPayload = await callAnthropic(
         'claude-opus-4-7', OPUS_SYSTEM, OPUS_TOOLS, messagesForCall
       );
@@ -394,22 +451,49 @@ app.post('/api/t1', async (req, res) => {
       finalSource = 'opus';
       finalReasoning = opusResult.reasoning;
       finalTools = opusResult.tools;
-      extraSonnetReasoning = sonnetResult.reasoning;
     } else {
-      finalSource = 'sonnet';
-      finalReasoning = sonnetResult.reasoning;
-      finalTools = sonnetResult.tools;
+      // Tier 1: Sonnet
+      const sonnetPayload = await callAnthropic(
+        'claude-sonnet-4-6', SONNET_SYSTEM, SONNET_TOOLS, messagesForCall
+      );
+      const sonnetResult = extractToolCalls(sonnetPayload, VALID_SONNET_TOOL_NAMES);
+
+      // Did Sonnet escalate? If yes, chain to Opus with the SAME user input.
+      // Per the user's spec, escalate carries no args — Opus re-plans from
+      // the raw utterance + frame (and the same prior history). Cleaner than
+      // relaying Sonnet's partial reasoning.
+      escalated = sonnetResult.tools.some(t => t.tool === 'escalate');
+
+      if (escalated) {
+        const opusPayload = await callAnthropic(
+          'claude-opus-4-7', OPUS_SYSTEM, OPUS_TOOLS, messagesForCall
+        );
+        const opusResult = extractToolCalls(opusPayload, VALID_OPUS_TOOL_NAMES);
+        finalSource = 'opus';
+        finalReasoning = opusResult.reasoning;
+        finalTools = opusResult.tools;
+        extraSonnetReasoning = sonnetResult.reasoning;
+      } else {
+        finalSource = 'sonnet';
+        finalReasoning = sonnetResult.reasoning;
+        finalTools = sonnetResult.tools;
+      }
     }
 
     // Persist this turn to the session store so a follow-up call (e.g.
-    // re-engage on stuck) sees what was planned.
+    // re-engage on stuck) sees what was planned. Frames are stored intact
+    // here — the per-call builder decides which ones survive into the next
+    // API payload based on the rolling window.
     if (session_id) {
-      const storedUserTurn = {
-        role: 'user', content: stripFramesFromUserContent(userContent),
-      };
+      const storedUserTurn = { role: 'user', content: userContent };
       const storedAssistantTurn = summarizeAssistantTurn(finalTools, finalReasoning);
       const messages = [...priorMessages, storedUserTurn, storedAssistantTurn];
-      T1_SESSIONS.set(session_id, { messages, lastTouch: Date.now() });
+      const escalatedNow = escalatedSticky || finalSource === 'opus';
+      T1_SESSIONS.set(session_id, {
+        messages,
+        lastTouch: Date.now(),
+        escalated: escalatedNow,
+      });
 
       // Spec: stop() ends the T1 session. Drop server-side state so the
       // next call with this id starts fresh.
