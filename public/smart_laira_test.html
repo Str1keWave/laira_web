@@ -392,6 +392,16 @@
           pi.brainAlive = true;
           setComponent('brain', 'ok', `online (${parsed.version || 'v?'})`);
           gateTextInput();
+          // Re-sync toggle + slider state to the Pi. Brain resets every
+          // state variable to defaults on service restart, and without
+          // this sync the browser's toggles would silently desync from
+          // Pi state (e.g., voice→AI toggle ON in UI but OFF on Pi =
+          // voice commands never forwarded to T1, hard to diagnose).
+          try {
+            sendChatToPi({ stt_to_brain: $sttToBrainToggle.checked });
+            sendChatToPi({ bbox_stream: $bboxToggle.checked });
+            sendChatToPi({ brain_params: { speed: currentSpeed, closeness: currentCloseness } });
+          } catch (_) { /* elements may not be bound yet on very-early hello */ }
         } else if (parsed.type === 'laira-log') {
           const level = parsed.level || 'evt';
           logConsole(level in {evt:1, ok:1, err:1, t1:1, tool:1, stt:1} ? level : 'evt',
