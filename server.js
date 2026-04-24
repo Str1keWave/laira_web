@@ -648,6 +648,24 @@ wss.on('connection', (ws, req) => {
     // Notify every connected user that LaiRA is (re)online.
     broadcastToUsers(JSON.stringify({ type: 'laiRA-connected' }));
 
+    // Server-side heartbeat to the Pi every 15s. The Pi's receive loop
+    // has a WS_TIMEOUT (currently 60s) — without something arriving on
+    // a steady cadence the Pi thinks the ws is dead and reconnects.
+    // After WebRTC ICE establishes, audio flows P2P and the signaling
+    // ws goes idle; before this heartbeat existed, that idle window
+    // tripped WS_TIMEOUT every 30s and produced an endless reconnect
+    // loop. The Pi's loop already recognizes type "alive" as a no-op
+    // that just resets last_message_time.
+    const aliveTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: 'alive', ts: Date.now() }));
+        } catch (e) {
+          console.error('alive heartbeat send failed', e);
+        }
+      }
+    }, 15000);
+
     laiRASocket.on('message', (message, isBinary) => {
       if (isBinary) {
         console.log('Received binary message from LaiRA');
@@ -666,6 +684,7 @@ wss.on('connection', (ws, req) => {
     });
 
     laiRASocket.on('close', () => {
+      clearInterval(aliveTimer);
       console.log('LaiRA disconnected');
       laiRASocket = null;
     });
