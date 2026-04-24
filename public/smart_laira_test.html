@@ -353,6 +353,11 @@
 
         // --- WebRTC handshake messages ---
         if (parsed.type === 'laiRA-connected') {
+          // Ask the Pi brain for its state. Startup race otherwise: the
+          // brain broadcasts laira-hello when its own ws to the server
+          // opens, which is typically BEFORE we load this page, so the
+          // initial hello is lost. This pull fixes that.
+          sendChatToPi({ hello_request: true });
           if (pi.handshakeTimer) clearTimeout(pi.handshakeTimer);
           pi.handshakeTimer = setTimeout(() => {
             pi.handshakeTimer = null;
