@@ -220,6 +220,10 @@
       <input id="bboxToggle" type="checkbox" />
       <label for="bboxToggle">show SAMURAI bbox</label>
     </div>
+    <div class="toggle-cell">
+      <input id="sttToBrainToggle" type="checkbox" />
+      <label for="sttToBrainToggle" title="when on, voice commands with the 'laira' wake word are forwarded to the AI in addition to showing here in the console">route voice → AI</label>
+    </div>
   </div>
 
   <div id="console"></div>
@@ -410,9 +414,14 @@
           const dotStatus = s === 'ready' ? 'ok' : (s === 'warming' ? 'busy' : s === 'error' ? 'err' : 'busy');
           setComponent('modal', dotStatus, s + (parsed.detail ? ` (${parsed.detail})` : ''));
           gateTextInput();
+        } else if (parsed.type === 'laira-stt') {
+          // Wake-word-stripped voice command. Always show in console;
+          // the 'forwarded_to_brain' flag only affects whether the Pi
+          // also submitted this to T1.
+          const phrase = parsed.phrase || '';
+          const arrow = parsed.forwarded_to_brain ? ' → AI' : '';
+          logConsole('stt', `🎤 "${phrase}"${arrow}`);
         }
-        // STT / legacy chat messages are silently ignored now — the brain
-        // owns STT routing (Phase future).
       } catch (err) {
         console.error('onPiMessage error', err);
       }
@@ -588,7 +597,8 @@
     const $speedVal    = document.getElementById('speedVal');
     const $closenessSlider = document.getElementById('closenessSlider');
     const $closenessVal    = document.getElementById('closenessVal');
-    const $bboxToggle      = document.getElementById('bboxToggle');
+    const $bboxToggle       = document.getElementById('bboxToggle');
+    const $sttToBrainToggle = document.getElementById('sttToBrainToggle');
 
     function pushBrainParams() {
       sendChatToPi({ brain_params: { speed: currentSpeed, closeness: currentCloseness } });
@@ -608,6 +618,15 @@
       showBbox = $bboxToggle.checked;
       sendChatToPi({ bbox_stream: showBbox });
       if (!showBbox && $overlay.width) ctx.clearRect(0, 0, $overlay.width, $overlay.height);
+    });
+
+    $sttToBrainToggle.addEventListener('change', () => {
+      // Tells the Pi brain whether to forward wake-word voice commands
+      // into the T1 pipeline. When off (default), voice still appears in
+      // console for diagnosis but doesn't actually drive LaiRA.
+      const on = $sttToBrainToggle.checked;
+      sendChatToPi({ stt_to_brain: on });
+      logConsole('evt', `voice → AI routing: ${on ? 'ON' : 'OFF'}`);
     });
 
     function drawOverlay() {
