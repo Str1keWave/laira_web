@@ -569,21 +569,52 @@ const server = app.listen(process.env.PORT || 3000, () => {
 });
 const wss = new WebSocket.Server({ server });
 
-// Define connections
+// Define connections.
+//
+// userSockets is a Set so multiple browsers can be connected simultaneously
+// (two tabs, /smart_laira_test + /user, a test harness + a real browser,
+// etc.) and all of them receive Pi→user messages. The old single-slot
+// `userSocket` was a latent bug — whichever /user client connected LAST
+// won the slot and everyone else was orphaned server-side, getting no
+// relayed laira-* messages even though their ws was still open. That's
+// what broke console rendering in /smart_laira_test when another client
+// (or a refreshed tab) stole the slot.
+//
+// `userSocket` is kept as a pointer to an arbitrary active user (updated
+// on every connect/close) so a couple of legacy consumers that only need
+// one target (e.g. if we ever need to pick one specific user for a
+// user-originated reply) still have something to reference. All Pi→user
+// broadcasts go through broadcastToUsers() which fans out to every socket.
+let userSockets = new Set();
 let userSocket = null;
 let laiRASocket = null;
 let forwardSocketSet = new Set(); // To handle multiple CLI clients
 
+function broadcastToUsers(message, opts = {}) {
+  for (const ws of userSockets) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(message, opts);
+      } catch (e) {
+        console.error('broadcastToUsers send failed', e);
+      }
+    }
+  }
+}
+
 wss.on('connection', (ws, req) => {
   if (req.url === '/user') {
+    userSockets.add(ws);
     userSocket = ws;
-    console.log('User connected');
+    console.log(`User connected (${userSockets.size} total)`);
 
     if (laiRASocket && laiRASocket.readyState === WebSocket.OPEN) {
-      userSocket.send(JSON.stringify({ type: 'laiRA-connected' }));
+      // Only tell the NEWLY-connected client that LaiRA is up; existing
+      // clients already know.
+      ws.send(JSON.stringify({ type: 'laiRA-connected' }));
     }
 
-    userSocket.on('message', (message, isBinary) => {
+    ws.on('message', (message, isBinary) => {
       if (isBinary) {
         console.log('Received binary message from User');
       } else {
@@ -601,17 +632,21 @@ wss.on('connection', (ws, req) => {
       }
     });
 
-    userSocket.on('close', () => {
-      console.log('User disconnected');
-      userSocket = null;
+    ws.on('close', () => {
+      userSockets.delete(ws);
+      if (userSocket === ws) {
+        // Pick any other still-open socket as the legacy pointer.
+        userSocket = null;
+        for (const s of userSockets) { userSocket = s; break; }
+      }
+      console.log(`User disconnected (${userSockets.size} remaining)`);
     });
   } else if (req.url === '/laiRA') {
     laiRASocket = ws;
     console.log('LaiRA connected');
 
-    if (userSocket && userSocket.readyState === WebSocket.OPEN) {
-      userSocket.send(JSON.stringify({ type: 'laiRA-connected' }));
-    }
+    // Notify every connected user that LaiRA is (re)online.
+    broadcastToUsers(JSON.stringify({ type: 'laiRA-connected' }));
 
     laiRASocket.on('message', (message, isBinary) => {
       if (isBinary) {
@@ -620,10 +655,9 @@ wss.on('connection', (ws, req) => {
         console.log('Received from LaiRA:', message);
       }
 
-      // Forward message to User if connected
-      if (userSocket && userSocket.readyState === WebSocket.OPEN) {
-        userSocket.send(message, { binary: isBinary });
-      }
+      // Forward to EVERY connected user (was previously only the most-
+      // recent one, which broke multi-tab and test-harness scenarios).
+      broadcastToUsers(message, { binary: isBinary });
 
       // Forward only text chat messages to CLI clients
       if (!isBinary) {
@@ -673,8 +707,9 @@ wss.on('connection', (ws, req) => {
   revStream.on('data', (data) => {
     try {
       const parsed = JSON.parse(data.toString());
-      if (parsed.type === "final" && userSocket && userSocket.readyState === WebSocket.OPEN) {
-        userSocket.send(JSON.stringify({ type: "voice-transcript", data: parsed }));
+      if (parsed.type === "final") {
+        // Previously sent to one userSocket; now fan out to all connected users.
+        broadcastToUsers(JSON.stringify({ type: "voice-transcript", data: parsed }));
       }
     } catch (err) {
       console.error("Error parsing Rev.ai data", err, data.toString());
