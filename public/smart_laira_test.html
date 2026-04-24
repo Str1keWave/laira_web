@@ -177,6 +177,8 @@
     <div class="value"><span class="dot" id="dot-brain"></span><span id="lbl-brain">waiting for hello…</span></div>
     <div class="label">SAMURAI (Modal)</div>
     <div class="value"><span class="dot" id="dot-modal"></span><span id="lbl-modal">unknown</span></div>
+    <div class="label">STT</div>
+    <div class="value"><span class="dot" id="dot-stt"></span><span id="lbl-stt">unknown</span></div>
   </div>
 
   <div id="t1-state-row">
@@ -424,6 +426,14 @@
           const dotStatus = s === 'ready' ? 'ok' : (s === 'warming' ? 'busy' : s === 'error' ? 'err' : 'busy');
           setComponent('modal', dotStatus, s + (parsed.detail ? ` (${parsed.detail})` : ''));
           gateTextInput();
+        } else if (parsed.type === 'laira-stt-status') {
+          // STT pipeline readiness. Models take a few seconds to load +
+          // JIT at Pi startup; during that window voice commands drop
+          // silently (nothing to buffer them into). Surfacing this here
+          // so the user knows when it's safe to talk vs wait.
+          const s = parsed.status || 'unknown';
+          const dotStatus = s === 'ready' ? 'ok' : (s === 'warming' ? 'busy' : s === 'error' ? 'err' : 'busy');
+          setComponent('stt', dotStatus, s + (parsed.detail ? ` (${parsed.detail})` : ''));
         } else if (parsed.type === 'laira-stt') {
           // Wake-word-stripped voice command. Always show in console;
           // the 'forwarded_to_brain' flag only affects whether the Pi
