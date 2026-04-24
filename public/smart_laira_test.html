@@ -106,6 +106,23 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px; color: #ccc; margin: 6px 0; min-height: 16px;
     }
+
+    /* Controls panel — sliders + overlay toggle */
+    #controls {
+      display: flex; gap: 16px; align-items: center;
+      width: min(900px, 96vw); margin: 8px 0;
+      padding: 8px 12px; background: #1a1a1a; border-radius: 6px;
+      font-size: 12px; color: #ccc; flex-wrap: wrap;
+    }
+    #controls .slider-cell { display: flex; align-items: center; gap: 8px; }
+    #controls label { font-weight: 500; color: #aaa; }
+    #controls input[type="range"] { width: 140px; accent-color: #4f46e5; }
+    #controls .val {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-width: 2ch; text-align: right; color: #e0e0e0; font-weight: 600;
+    }
+    #controls .toggle-cell { display: flex; align-items: center; gap: 6px; }
+    #controls input[type="checkbox"] { accent-color: #4f46e5; cursor: pointer; }
     #tracker-stats .arrived  { color: #2ecc71; font-weight: 700; }
     #tracker-stats .stuck    { color: #e74c3c; font-weight: 700; }
     #tracker-stats .lost     { color: #e74c3c; }
@@ -201,6 +218,23 @@
 
   <div id="tracker-stats"></div>
 
+  <div id="controls">
+    <div class="slider-cell">
+      <label for="speedSlider">speed</label>
+      <input id="speedSlider" type="range" min="1" max="10" step="1" value="5" />
+      <span class="val" id="speedVal">5</span>
+    </div>
+    <div class="slider-cell">
+      <label for="closenessSlider" title="divides turn speed at deadzone edge; 1 = no slowdown">closeness÷</label>
+      <input id="closenessSlider" type="range" min="1" max="8" step="1" value="3" />
+      <span class="val" id="closenessVal">3</span>
+    </div>
+    <div class="toggle-cell">
+      <input id="bboxToggle" type="checkbox" />
+      <label for="bboxToggle">show SAMURAI bbox</label>
+    </div>
+  </div>
+
   <div id="console"></div>
 
   <div id="commandBar">
@@ -243,6 +277,40 @@
     const ctx       = $overlay.getContext('2d');
 
     const components = { pilink: 'busy', video: 'busy', config: 'busy', modal: 'busy', t1: 'busy' };
+
+    // ── Control panel state ────────────────────────────────────────────
+    // Speed: 1-10, default 5 (matches Pi's BASE_TICK_INTERVAL = 50ms).
+    // Closeness: 1-8, default 3 (divides turn speed by N at deadzone edge).
+    // showBbox: overlay toggle, default off per user spec.
+    let currentSpeed = 5;
+    let currentCloseness = 3;
+    let showBbox = false;
+    const $speedSlider = document.getElementById('speedSlider');
+    const $speedVal    = document.getElementById('speedVal');
+    const $closenessSlider = document.getElementById('closenessSlider');
+    const $closenessVal    = document.getElementById('closenessVal');
+    const $bboxToggle      = document.getElementById('bboxToggle');
+    $speedSlider.addEventListener('input', () => {
+      currentSpeed = parseInt($speedSlider.value, 10);
+      $speedVal.textContent = String(currentSpeed);
+    });
+    $closenessSlider.addEventListener('input', () => {
+      currentCloseness = parseInt($closenessSlider.value, 10);
+      $closenessVal.textContent = String(currentCloseness);
+    });
+    $bboxToggle.addEventListener('change', () => {
+      showBbox = $bboxToggle.checked;
+      // Notify Pi so the brain (post-Phase-3) can skip emitting bboxes when
+      // we don't want them. For Phase 2 the brain doesn't exist yet and the
+      // Pi's legacy handle_message just ignores unknown keys, so this is a
+      // forward-compat no-op today.
+      sendChatToPi({ bbox_stream: showBbox });
+      // If the overlay was just turned off, clear the canvas so any already-
+      // drawn rectangle disappears immediately.
+      if (!showBbox && $overlay.width && $overlay.height) {
+        ctx.clearRect(0, 0, $overlay.width, $overlay.height);
+      }
+    });
 
     // T1 + tracking state. session_id is the load-bearing race-guard.
     // (See t1_test.html for the long-form rationale.)
@@ -572,17 +640,27 @@
     // as zero, so the first stop()'s zero is identical to "current" and
     // gets skipped. Once she's actually moved, lastKeystateSig reflects that
     // and a subsequent stop() correctly emits zero to halt the motion.
-    const ZERO_KEYSTATE_SIG = JSON.stringify({ w:'False', a:'False', s:'False', d:'False', q:'False', e:'False' });
+    //
+    // Sig now includes speed so a speed-only change (tracking-induced turn
+    // slowdown) propagates even if the keystate bits are stable.
+    const ZERO_KEYSTATE_SIG = JSON.stringify({ keystates: { w:'False', a:'False', s:'False', d:'False', q:'False', e:'False' }, speed: 5 });
     let lastKeystateSig = ZERO_KEYSTATE_SIG;
 
-    function executeKeystate(ks) {
+    // speedOverride: optional. If provided, this keystate goes out with that
+    // speed instead of the slider's base value. Used by the tracker's turn-
+    // slowdown math. Omitted = use base slider value.
+    function executeKeystate(ks, speedOverride) {
       const full = { w:false, a:false, s:false, d:false, q:false, e:false, ...ks };
       const stringified = {};
       for (const k in full) stringified[k] = full[k] ? 'True' : 'False';
-      const sig = JSON.stringify(stringified);
+      const speed = (typeof speedOverride === 'number' && isFinite(speedOverride))
+        ? Math.max(1, Math.min(10, speedOverride))
+        : currentSpeed;
+      const payload = { keystates: stringified, speed };
+      const sig = JSON.stringify(payload);
       if (sig === lastKeystateSig) return;
       lastKeystateSig = sig;
-      sendChatToPi({ keystates: stringified });
+      sendChatToPi(payload);
     }
 
     // Manual button handlers — each cancels any active T1 first.
@@ -802,9 +880,23 @@
 
       let turnPart = '';
       let distPart = '';
+      // Default effectiveSpeed = slider base. Gets overridden below when
+      // we're turning, so the closer to center the slower the rotation.
+      let effectiveSpeed = currentSpeed;
       if (!centered) {
         if (offset > 0) { ks.d = true; turnPart = 'right'; }
         else            { ks.a = true; turnPart = 'left'; }
+        // Turn-speed scaling: xNorm is 0 at deadzone edge, 1 at frame edge.
+        // divisor = currentCloseness at deadzone, 1 at frame edge (linear).
+        // So effectiveSpeed = currentSpeed / divisor — slowest at center,
+        // full speed at frame edge. Matches spec: "divides speed by N at
+        // deadzone, divides less and less until dividing by 1 at the edges".
+        const absOff = Math.abs(offset);
+        const halfW = W / 2;
+        const denom = Math.max(1, halfW - horizDeadzone);
+        const xNorm = Math.max(0, Math.min(1, (absOff - horizDeadzone) / denom));
+        const divisor = currentCloseness - (currentCloseness - 1) * xNorm;
+        effectiveSpeed = currentSpeed / divisor;
       }
 
       if (sess.mode === 'go_to') {
@@ -856,7 +948,7 @@
       else if (turnPart)         action = `centering: turn ${turnPart}`;
       else                       action = distPart || 'tracking';
 
-      return { keystates: ks, action, arrived, stuck, depthCm, offset, status };
+      return { keystates: ks, action, arrived, stuck, depthCm, offset, status, effectiveSpeed };
     }
 
     function renderTrackerStats(info) {
@@ -880,16 +972,21 @@
       pushBboxHistory(bbox, depthCm);
       sess.lastBboxAt = performance.now();
       const info = computeKeystatesAndStatus(bbox, depthCm);
-      const { keystates, action, arrived, stuck } = info;
+      const { keystates, action, arrived, stuck, effectiveSpeed } = info;
       setT1State('TRACKING', `${sess.mode}: ${sess.target} — ${action}`);
       renderTrackerStats({
         mode: sess.mode, target: sess.targetDistanceCm,
         depthCm, action, status: info.status,
       });
-      const sig = JSON.stringify(keystates);
+      // Hash keystates + speed together so a speed-only change (e.g. target
+      // creeps toward center → turn slowdown) still triggers a send. The
+      // per-tracking-loop dedupe is narrower than executeKeystate's global
+      // dedupe (which zeros out after cancel), so keep it as the fast-path
+      // suppression; executeKeystate's own check handles boundary cases.
+      const sig = JSON.stringify({ keystates, speed: effectiveSpeed });
       if (sig !== lastTrackingKeystateSig) {
         lastTrackingKeystateSig = sig;
-        executeKeystate(keystates);
+        executeKeystate(keystates, effectiveSpeed);
       }
       if (arrived) {
         logConsole('ok', `arrived at "${sess.target}" (depth=${depthCm}cm <= ${sess.targetDistanceCm}cm + ${DISTANCE_TOL_CM}cm tol)`);
@@ -1001,6 +1098,10 @@
     // ===================================================================
     function drawOverlay() {
       ctx.clearRect(0, 0, $overlay.width, $overlay.height);
+      // Overlay is off by default (per user spec). When disabled, leave the
+      // canvas clear — tracking still runs internally, we just don't draw
+      // on top of the video.
+      if (!showBbox) return;
       if (state.lastSamBbox) {
         const [x, y, w, h] = state.lastSamBbox;
         ctx.strokeStyle = '#00aaff';
