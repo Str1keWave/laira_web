@@ -600,6 +600,20 @@
               console.log("🚀 starting new handshake");
               startPeerConnection();
             }, 200);
+          } else if (parsed.type === "laiRA-disconnected") {
+            // Pi went away — tear down the peer connection so the next
+            // laiRA-connected starts a fresh handshake instead of trying
+            // to reuse a half-dead PC. Without this, a Pi restart could
+            // leave the browser's PC in a state where it ignores the
+            // reconnect broadcast and video/control silently stops.
+            console.log("🔌 LaiRA disconnected — tearing down PC");
+            if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
+            if (peerConnection) {
+              try { peerConnection.close(); } catch (_) {}
+              peerConnection = null;
+              remoteDescriptionSet = false;
+              candidateQueue = [];
+            }
           } else if (parsed.type === "answer") {
             await peerConnection.setRemoteDescription(parsed);
             remoteDescriptionSet = true;

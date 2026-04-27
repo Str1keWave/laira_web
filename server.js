@@ -687,6 +687,14 @@ wss.on('connection', (ws, req) => {
       clearInterval(aliveTimer);
       console.log('LaiRA disconnected');
       laiRASocket = null;
+      // Tell every connected browser the Pi went away so they can tear
+      // down their RTCPeerConnection and be ready to renegotiate cleanly
+      // when the Pi reconnects. Without this, a browser that was already
+      // connected during a Pi restart can end up in a half-dead state
+      // where the broadcast on Pi reconnect doesn't trigger a fresh
+      // handshake (because the browser's PC is technically still alive),
+      // and video/control just stops working until manual restart.
+      broadcastToUsers(JSON.stringify({ type: 'laiRA-disconnected' }));
     });
   } else if (req.url === '/forward') {
     // Handle connections to WebSocket B

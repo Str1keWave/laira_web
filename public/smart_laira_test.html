@@ -376,6 +376,22 @@
             logConsole('evt', 'LaiRA connected — starting WebRTC handshake');
             startPeerConnection();
           }, 200);
+        } else if (parsed.type === 'laiRA-disconnected') {
+          // Pi went away — tear down the peer connection so the next
+          // laiRA-connected starts a fresh handshake instead of trying
+          // to reuse a half-dead PC.
+          logConsole('evt', 'LaiRA disconnected — tearing down PC');
+          if (pi.handshakeTimer) { clearTimeout(pi.handshakeTimer); pi.handshakeTimer = null; }
+          if (pi.peerConnection) {
+            try { pi.peerConnection.close(); } catch(_) {}
+            pi.peerConnection = null;
+            pi.remoteDescriptionSet = false;
+            pi.candidateQueue = [];
+          }
+          setComponent('video', 'err', 'Pi disconnected');
+          setComponent('brain', 'err', 'Pi disconnected');
+          pi.brainAlive = false;
+          gateTextInput();
         } else if (parsed.type === 'answer') {
           if (!pi.peerConnection) return;
           await pi.peerConnection.setRemoteDescription(parsed);
