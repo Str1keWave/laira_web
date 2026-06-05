@@ -92,6 +92,50 @@
     }
     #audioToggle:hover { background: rgba(255,255,255,0.18); }
 
+    /* ===== Fullscreen + mobile joystick (added) ===== */
+    #fsBtn {
+      position: absolute; top: 8px; right: 8px; z-index: 40;
+      width: 38px; height: 38px; padding: 0; font-size: 18px; line-height: 1;
+      background: rgba(0,0,0,0.55); color: #fff; border: 1px solid rgba(255,255,255,0.35);
+      border-radius: 8px; cursor: pointer;
+    }
+    #fsBtn:hover { background: rgba(255,255,255,0.18); }
+
+    /* CSS-based fullscreen — works on iOS too (the Fullscreen API doesn't
+       fullscreen arbitrary elements on iOS Safari), and lets the joystick
+       overlay the feed. */
+    #stage.fullscreen {
+      position: fixed; inset: 0; z-index: 9000; width: 100vw; height: 100vh;
+      max-width: none; margin: 0; background: #000;
+      display: flex; align-items: center; justify-content: center;
+    }
+    #stage.fullscreen #video, #stage.fullscreen #overlay {
+      width: 100%; height: 100%; max-width: none; max-height: none; object-fit: contain;
+    }
+    body.fs-active { overflow: hidden; }
+
+    /* Draggable movement circle, parked bottom-left so it never blocks the
+       middle of the feed. Hidden by default; shown on touch devices and
+       whenever the stage is fullscreen. */
+    #joystick {
+      position: absolute; left: 18px; bottom: 22px; z-index: 41;
+      width: 116px; height: 116px; border-radius: 50%;
+      background: rgba(255,255,255,0.10); border: 2px solid rgba(255,255,255,0.34);
+      touch-action: none; display: none; user-select: none; -webkit-user-select: none;
+    }
+    #joyKnob {
+      position: absolute; left: 50%; top: 50%; width: 46px; height: 46px;
+      margin: -23px 0 0 -23px; border-radius: 50%;
+      background: rgba(79,70,229,0.9); border: 2px solid #fff;
+      pointer-events: none; transition: transform 0.04s linear;
+    }
+    #joyHint {
+      position: absolute; left: 50%; bottom: -16px; transform: translateX(-50%);
+      font-size: 10px; color: rgba(255,255,255,0.5); white-space: nowrap; pointer-events: none;
+    }
+    @media (pointer: coarse) { #joystick { display: block; } }
+    #stage.fullscreen #joystick { display: block; }
+
     #tracker-stats {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px; color: #ccc; margin: 6px 0; min-height: 16px;
@@ -203,6 +247,9 @@
     </div>
 
     <button id="audioToggle">🔇 Audio muted</button>
+
+    <button id="fsBtn" title="fullscreen">⛶</button>
+    <div id="joystick"><div id="joyKnob"></div><div id="joyHint">drag to move</div></div>
   </div>
 
   <div id="tracker-stats"></div>
@@ -623,6 +670,60 @@
       const sig = JSON.stringify(KEY_STATES);
       if (sig !== lastKeystateSent) { lastKeystateSent = sig; executeKeystate(KEY_STATES); }
     }
+
+    // ===================================================================
+    // Fullscreen toggle + mobile movement joystick (added)
+    // ===================================================================
+    const $stage = document.getElementById('stage');
+    const $fsBtn = document.getElementById('fsBtn');
+    function toggleFullscreen() {
+      const on = $stage.classList.toggle('fullscreen');
+      document.body.classList.toggle('fs-active', on);
+      $fsBtn.textContent = on ? '✕' : '⛶';
+    }
+    $fsBtn.addEventListener('click', toggleFullscreen);
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && $stage.classList.contains('fullscreen')) toggleFullscreen();
+    });
+
+    // Draggable circle → single dominant WASD direction (or stand still in
+    // the center deadzone). Uses pointer events so touch + mouse both work.
+    const $joy  = document.getElementById('joystick');
+    const $knob = document.getElementById('joyKnob');
+    let joyId = null, joyDir = null;
+    function joyKey(dx, dy) {
+      if (Math.hypot(dx, dy) < 16) return null;          // center → stand still
+      if (Math.abs(dx) >= Math.abs(dy)) return dx > 0 ? 'd' : 'a'; // right→rotate_right, left→rotate_left
+      return dy > 0 ? 's' : 'w';                          // down→back, up→forward
+    }
+    function joyMove(cx, cy) {
+      const r = $joy.getBoundingClientRect();
+      const ox = r.left + r.width / 2, oy = r.top + r.height / 2;
+      let dx = cx - ox, dy = cy - oy;
+      const max = r.width / 2 - 8, dist = Math.hypot(dx, dy);
+      if (dist > max) { dx = dx / dist * max; dy = dy / dist * max; }
+      $knob.style.transform = `translate(${dx}px, ${dy}px)`;
+      const key = joyKey(dx, dy);
+      if (key !== joyDir) {
+        joyDir = key;
+        cancelBrain();                                    // manual input cancels the brain plan
+        executeKeystate(key ? { [key]: true } : {});
+      }
+    }
+    function joyRelease() {
+      joyId = null; joyDir = null;
+      $knob.style.transform = 'translate(0,0)';
+      executeKeystate({});                                // release → stand still
+    }
+    $joy.addEventListener('pointerdown', e => {
+      joyId = e.pointerId;
+      try { $joy.setPointerCapture(e.pointerId); } catch (x) {}
+      joyMove(e.clientX, e.clientY);
+      e.preventDefault();
+    });
+    $joy.addEventListener('pointermove', e => { if (e.pointerId === joyId) joyMove(e.clientX, e.clientY); });
+    $joy.addEventListener('pointerup',     e => { if (e.pointerId === joyId) joyRelease(); });
+    $joy.addEventListener('pointercancel', e => { if (e.pointerId === joyId) joyRelease(); });
 
     // ===================================================================
     // Sliders + bbox toggle

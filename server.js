@@ -1,7 +1,100 @@
 const express = require('express');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 const app = express();
 const revai = require('revai-node-sdk');
+
+// =============================================================
+// Passkey gate (lightweight access control)
+// -------------------------------------------------------------
+// Goal: stop someone who merely finds the public URL from instantly
+// driving a camera that moves around a home. The passkey is checked
+// SERVER-SIDE and is never sent to the browser, so scraping the site
+// reveals nothing — you'd have to find THIS repo to read the passkey.
+// Weak by design (passkey lives in source for now). TODO: when home,
+// set LAIRA_PASSKEY as a Render env var and delete the inline default.
+// =============================================================
+const LAIRA_PASSKEY = process.env.LAIRA_PASSKEY || 'robotdog';
+// Cookie value is a hash of the passkey (+ a version salt) so we can
+// validate statelessly without storing the raw passkey in the cookie.
+const AUTH_TOKEN = crypto.createHash('sha256')
+  .update(LAIRA_PASSKEY + '::laira-gate-v1').digest('hex');
+// Pages (and their raw .html equivalents served by express.static) that
+// require the passkey. The control WebSocket (/user) is gated separately
+// below — that's the channel that actually moves the robot.
+const PROTECTED_PATHS = new Set([
+  '/user', '/user.html', '/user2', '/user2.html',
+  '/smart_laira_test', '/smart_laira_test.html',
+]);
+
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.cookie || '';
+  raw.split(';').forEach(part => {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  });
+  return out;
+}
+function isAuthed(req) {
+  return parseCookies(req).laira_auth === AUTH_TOKEN;
+}
+
+function loginPage(nextPath, error) {
+  const safeNext = (typeof nextPath === 'string' && nextPath.startsWith('/')) ? nextPath : '/smart_laira_test';
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LaiRA — passkey</title>
+<style>
+  html,body{height:100%;margin:0;background:#0b0d12;color:#e7e7ea;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    display:flex;align-items:center;justify-content:center}
+  form{background:#161922;padding:28px 26px;border-radius:14px;
+    box-shadow:0 10px 40px rgba(0,0,0,.5);width:min(92vw,320px);text-align:center}
+  h1{font-size:18px;margin:0 0 4px}p{color:#8b90a0;font-size:13px;margin:0 0 18px}
+  input{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:9px;
+    border:1px solid #2a2f3c;background:#0e1118;color:#fff;font-size:16px;margin-bottom:12px}
+  button{width:100%;padding:12px;border:0;border-radius:9px;background:#4f46e5;
+    color:#fff;font-size:15px;font-weight:600;cursor:pointer}
+  .err{color:#ff6b6b;font-size:13px;margin:-6px 0 12px}
+  .dog{font-size:34px;margin-bottom:6px}
+</style></head><body>
+<form method="POST" action="/login">
+  <div class="dog">🐾</div>
+  <h1>LaiRA access</h1>
+  <p>Enter the passkey to continue.</p>
+  ${error ? `<div class="err">Incorrect passkey.</div>` : ``}
+  <input type="password" name="passkey" placeholder="passkey" autofocus autocomplete="off" />
+  <input type="hidden" name="next" value="${safeNext}" />
+  <button type="submit">Unlock</button>
+</form></body></html>`;
+}
+
+app.use(express.urlencoded({ extended: false }));
+
+app.get('/login', (req, res) => {
+  res.send(loginPage(req.query.next, false));
+});
+app.post('/login', (req, res) => {
+  const pass = ((req.body && req.body.passkey) || '').trim();
+  if (pass === LAIRA_PASSKEY) {
+    // 1-year cookie. HttpOnly so page JS can't leak it; Secure for Render's HTTPS.
+    res.setHeader('Set-Cookie',
+      `laira_auth=${AUTH_TOKEN}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax; Secure`);
+    const next = (req.body.next && req.body.next.startsWith('/')) ? req.body.next : '/smart_laira_test';
+    return res.redirect(next);
+  }
+  res.status(401).send(loginPage(req.body && req.body.next, true));
+});
+
+// Gate runs before static + page routes. Unauthed hits to a protected
+// page bounce to /login (preserving where they were headed).
+app.use((req, res, next) => {
+  if (PROTECTED_PATHS.has(req.path) && !isAuthed(req)) {
+    return res.redirect('/login?next=' + encodeURIComponent(req.path));
+  }
+  next();
+});
 
 app.use(express.static('public'));
 // Frames are sent as base64 JPEG in /api/t1; bump the JSON limit accordingly.
@@ -604,6 +697,14 @@ function broadcastToUsers(message, opts = {}) {
 
 wss.on('connection', (ws, req) => {
   if (req.url === '/user') {
+    // Gate the control channel: a browser must carry the passkey cookie
+    // (set after /login). The Pi connects on /laiRA, not here, so it's
+    // unaffected. This is what actually stops an unauthed party from
+    // driving the robot / seeing the WebRTC feed even if they skip the page.
+    if (!isAuthed(req)) {
+      try { ws.close(1008, 'auth required'); } catch (e) {}
+      return;
+    }
     userSockets.add(ws);
     userSocket = ws;
     console.log(`User connected (${userSockets.size} total)`);
