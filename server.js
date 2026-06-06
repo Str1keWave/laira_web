@@ -709,6 +709,19 @@ wss.on('connection', (ws, req) => {
     userSocket = ws;
     console.log(`User connected (${userSockets.size} total)`);
 
+    // Heartbeat to the browser every 10s. The /user link can go half-open on
+    // mobile (radio sleep / carrier-NAT idle reap) with readyState stuck OPEN,
+    // so keystates silently vanish while WebRTC media keeps flowing P2P. The
+    // browser keys its link-watchdog off steady inbound traffic; if these stop
+    // arriving it knows the socket is dead and reconnects. Without this, control
+    // dies mid-session and never recovers until a manual page reload.
+    const userAliveTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: 'alive', ts: Date.now() })); }
+        catch (e) { console.error('user heartbeat send failed', e); }
+      }
+    }, 10000);
+
     if (laiRASocket && laiRASocket.readyState === WebSocket.OPEN) {
       // Only tell the NEWLY-connected client that LaiRA is up; existing
       // clients already know.
@@ -734,6 +747,7 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('close', () => {
+      clearInterval(userAliveTimer);
       userSockets.delete(ws);
       if (userSocket === ws) {
         // Pick any other still-open socket as the legacy pointer.

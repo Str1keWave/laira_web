@@ -324,7 +324,16 @@
       audioEnabled: false,
       brainAlive: false,
       modalReady: false,
+      // --- link health / auto-reconnect ---
+      lastRxAt: 0,          // ms timestamp of the last message received on /user
+      reconnectDelay: 0,    // current backoff (ms); 0 = healthy / not backing off
+      reconnectTimer: null, // pending reconnect setTimeout id
+      authFailed: false,    // server closed us with 1008 (passkey missing/expired)
     };
+
+    const PI_RECONNECT_BASE = 1000;   // first retry after 1s
+    const PI_RECONNECT_MAX  = 15000;  // cap backoff at 15s
+    const PI_STALE_MS       = 25000;  // no inbound for 25s => link is dead, reconnect
 
     let currentSpeed = 5;
     let currentCloseness = 3;
@@ -374,17 +383,42 @@
     // Pi link: /user WebSocket + WebRTC handshake
     // Mirrors user.html's existing flow so LaiRA-side code doesn't notice.
     // ===================================================================
+    function schedulePiReconnect() {
+      if (pi.authFailed) return;        // passkey rejected — don't hammer the gate
+      if (pi.reconnectTimer) return;    // already scheduled
+      pi.reconnectDelay = pi.reconnectDelay
+        ? Math.min(pi.reconnectDelay * 1.8, PI_RECONNECT_MAX)
+        : PI_RECONNECT_BASE;
+      const delay = Math.round(pi.reconnectDelay);
+      setComponent('pilink', 'busy', 'reconnecting in ' + Math.round(delay / 1000) + 's…');
+      logConsole('evt', 'Pi link down — reconnecting in ' + delay + 'ms');
+      pi.reconnectTimer = setTimeout(() => {
+        pi.reconnectTimer = null;
+        openPiSocket();
+      }, delay);
+    }
+
     function openPiSocket() {
+      if (pi.reconnectTimer) { clearTimeout(pi.reconnectTimer); pi.reconnectTimer = null; }
+      // Drop any previous socket so a zombie's eventual close can't drive
+      // reconnect logic for a connection we've already replaced.
+      if (pi.socket) { try { pi.socket.close(); } catch(_) {} }
+
       setComponent('pilink', 'busy', 'connecting…');
       const url = 'wss://' + window.location.hostname + '/user';
-      pi.socket = new WebSocket(url);
+      const sock = new WebSocket(url);
+      pi.socket = sock;
+      pi.lastRxAt = Date.now();   // grace window so the watchdog doesn't insta-fire
 
-      pi.socket.addEventListener('open', () => {
+      sock.addEventListener('open', () => {
+        if (pi.socket !== sock) return;   // superseded by a newer socket
+        pi.reconnectDelay = 0;            // healthy — reset backoff
+        pi.lastRxAt = Date.now();
         setComponent('pilink', 'ok', 'open');
         logConsole('evt', 'Pi link open');
       });
-      pi.socket.addEventListener('close', () => {
-        setComponent('pilink', 'err', 'closed');
+      sock.addEventListener('close', (ev) => {
+        if (pi.socket !== sock) return;   // an old/replaced socket closing — ignore
         setComponent('brain', 'err', 'disconnected');
         pi.brainAlive = false;
         gateTextInput();
@@ -394,12 +428,27 @@
           pi.remoteDescriptionSet = false;
           pi.candidateQueue = [];
         }
+        if (ev && ev.code === 1008) {
+          // Passkey cookie missing/expired — stop retrying, send back to /login.
+          pi.authFailed = true;
+          setComponent('pilink', 'err', 'auth required');
+          logConsole('err', 'Pi link rejected: passkey required — redirecting to /login');
+          setTimeout(() => { window.location.href = '/login'; }, 1200);
+          return;
+        }
+        setComponent('pilink', 'err', 'closed');
+        schedulePiReconnect();
       });
-      pi.socket.addEventListener('error', () => setComponent('pilink','err','error'));
-      pi.socket.addEventListener('message', onPiMessage);
+      sock.addEventListener('error', () => {
+        if (pi.socket !== sock) return;
+        setComponent('pilink', 'err', 'error');
+        // A real failure fires 'close' right after; reconnect is handled there.
+      });
+      sock.addEventListener('message', onPiMessage);
     }
 
     async function onPiMessage(event) {
+      pi.lastRxAt = Date.now();   // any inbound proves the /user socket is live
       try {
         const data = await (event.data instanceof Blob ? event.data.text() : event.data);
         const parsed = JSON.parse(data);
@@ -579,6 +628,23 @@
     setInterval(() => {
       if (pi.socket && pi.socket.readyState === WebSocket.OPEN) {
         pi.socket.send(JSON.stringify({ type: 'alive', message: JSON.stringify({ alive: 'healthy' }) }));
+      }
+    }, 5000);
+
+    // Link watchdog. A mobile WebSocket can go half-open (TCP silently dead)
+    // while readyState still reports OPEN: sends vanish, no 'close' ever fires,
+    // so control dies while WebRTC media keeps flowing P2P. The server
+    // heartbeats every /user socket (~10s); if NOTHING arrives for PI_STALE_MS
+    // we treat the link as dead, force it closed (which fires the close handler
+    // -> schedulePiReconnect) and renegotiate from scratch.
+    setInterval(() => {
+      if (!pi.socket || pi.authFailed) return;
+      if (pi.socket.readyState !== WebSocket.OPEN) return;
+      const idle = Date.now() - pi.lastRxAt;
+      if (idle > PI_STALE_MS) {
+        logConsole('err', 'Pi link stale (no data ' + Math.round(idle / 1000) + 's) — forcing reconnect');
+        setComponent('pilink', 'err', 'stale — reconnecting');
+        try { pi.socket.close(); } catch(_) {}
       }
     }, 5000);
 
