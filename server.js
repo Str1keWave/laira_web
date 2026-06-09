@@ -90,8 +90,19 @@ app.post('/login', (req, res) => {
 // Gate runs before static + page routes. Unauthed hits to a protected
 // page bounce to /login (preserving where they were headed).
 app.use((req, res, next) => {
-  if (PROTECTED_PATHS.has(req.path) && !isAuthed(req)) {
-    return res.redirect('/login?next=' + encodeURIComponent(req.path));
+  const p = req.path;
+  // /api/* and /turn-credentials proxy PAID services (Anthropic via
+  // T1_PROMPT_KEY; metered.live TURN) with no auth of their own. Anyone on
+  // the internet could POST /api/t1 or /api/vision to burn Claude credits, or
+  // pull TURN creds. Gate them behind the same passkey as the pages. The Pi
+  // brain calls Anthropic directly with its own key, so this only affects the
+  // browser demo pages (which can log in via /login first). 401 (not redirect)
+  // so programmatic callers get a clean status instead of HTML.
+  const apiNeedsAuth = p.startsWith('/api/') || p === '/turn-credentials';
+  const needsAuth = PROTECTED_PATHS.has(p) || apiNeedsAuth;
+  if (needsAuth && !isAuthed(req)) {
+    if (apiNeedsAuth) return res.status(401).json({ error: 'auth required' });
+    return res.redirect('/login?next=' + encodeURIComponent(p));
   }
   next();
 });

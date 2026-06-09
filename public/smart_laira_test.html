@@ -854,8 +854,14 @@
       const cls = ({
         arrived:'arrived', stuck:'stuck', lost:'lost', approach:'approach', hold:'hold',
       })[info.status] || '';
-      $stats.innerHTML = `mode=${info.mode}  dist=${dist}  target=${tgt}  ${delta}  ` +
-        `<span class="${cls}">[${info.action}]</span>`;
+      // SECURITY: info.* arrives over the /user WS, broadcast from whoever is
+      // connected on /laiRA (which is unauthenticated server-side). Escape
+      // every interpolated field — an unescaped innerHTML here is stored XSS
+      // in an authenticated page that can drive the robot via the open socket.
+      // cls comes from the fixed whitelist above, so it stays unescaped.
+      const esc = s => escapeHtml(String(s));
+      $stats.innerHTML = `mode=${esc(info.mode)}  dist=${esc(dist)}  target=${esc(tgt)}  ${esc(delta)}  ` +
+        `<span class="${cls}">[${esc(info.action)}]</span>`;
     }
 
     // ===================================================================
