@@ -72,7 +72,9 @@
     #sent-log .row .ts { color: #5b8a6b; margin-right: 4px; }
 
     #legend {
-      position: absolute; top: 8px; right: 8px;
+      /* right: 54px (not 8px) — #fsBtn occupies the top-right corner and
+         was rendering on top of this legend. */
+      position: absolute; top: 8px; right: 54px;
       background: rgba(0,0,0,0.55); padding: 6px 10px; border-radius: 4px;
       font-size: 11px; color: #ccc;
     }
@@ -712,6 +714,17 @@
         const cmd = btn.dataset.cmd;
         cancelBrain();
         if (cmd === 'stop') { executeKeystate({}); return; }
+        if (cmd === 'stand') {
+          // The old zero-keystate "stand" payload didn't actually stand
+          // her up from sit/lie (zero keystates don't clear the Pi's
+          // angle-mode, and the dedup often swallowed the send entirely —
+          // the button was a no-op). Route through the brain's tier-1
+          // keyword path instead: it's local-only (no cloud round-trip)
+          // and runs the real stand-up transition (motors on + reset +
+          // settle) via brain_stand_up().
+          sendChatToPi({ user_text: 'stand' });
+          return;
+        }
         executePose(cmd);
       });
     });

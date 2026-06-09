@@ -11,10 +11,17 @@ const revai = require('revai-node-sdk');
 // driving a camera that moves around a home. The passkey is checked
 // SERVER-SIDE and is never sent to the browser, so scraping the site
 // reveals nothing — you'd have to find THIS repo to read the passkey.
-// Weak by design (passkey lives in source for now). TODO: when home,
-// set LAIRA_PASSKEY as a Render env var and delete the inline default.
+// The real passkey now lives in Render's PASSWORD env var; the inline
+// 'robotdog' default only applies when running locally with no env set.
 // =============================================================
-const LAIRA_PASSKEY = process.env.LAIRA_PASSKEY || 'robotdog';
+const LAIRA_PASSKEY = process.env.PASSWORD || process.env.LAIRA_PASSKEY || 'robotdog';
+// Optional device auth for the robot's own /laiRA socket. When DEVICE_KEY
+// is set (Render env var), the Pi must connect with ?key=<DEVICE_KEY>
+// (it appends LAIRA_DEVICE_KEY from its .env). When unset, /laiRA stays
+// open as before — set BOTH sides to activate. Without it, anyone who
+// finds the URL can connect to /laiRA, hijack the robot slot, receive
+// every user's control traffic, and answer WebRTC offers as "the robot".
+const DEVICE_KEY = (process.env.DEVICE_KEY || '').trim();
 // Cookie value is a hash of the passkey (+ a version salt) so we can
 // validate statelessly without storing the raw passkey in the cookie.
 const AUTH_TOKEN = crypto.createHash('sha256')
@@ -75,7 +82,33 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/login', (req, res) => {
   res.send(loginPage(req.query.next, false));
 });
+// Brute-force throttle on /login: a short passkey with unlimited
+// attempts is crackable by a dumb loop. In-memory per-IP window —
+// resets on deploy, which is fine for this threat model.
+const _loginAttempts = new Map(); // ip -> [timestamps]
+const LOGIN_WINDOW_MS = 60 * 1000;
+const LOGIN_MAX_PER_WINDOW = 10;
+function loginRateLimited(req) {
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?')
+    .toString().split(',')[0].trim();
+  const now = Date.now();
+  const arr = (_loginAttempts.get(ip) || []).filter(t => now - t < LOGIN_WINDOW_MS);
+  arr.push(now);
+  _loginAttempts.set(ip, arr);
+  if (_loginAttempts.size > 1000) {
+    // Bounded memory: drop the oldest entries wholesale under abuse.
+    for (const k of _loginAttempts.keys()) {
+      _loginAttempts.delete(k);
+      if (_loginAttempts.size <= 500) break;
+    }
+  }
+  return arr.length > LOGIN_MAX_PER_WINDOW;
+}
+
 app.post('/login', (req, res) => {
+  if (loginRateLimited(req)) {
+    return res.status(429).send(loginPage(req.body && req.body.next, true));
+  }
   const pass = ((req.body && req.body.passkey) || '').trim();
   if (pass === LAIRA_PASSKEY) {
     // 1-year cookie. HttpOnly so page JS can't leak it; Secure for Render's HTTPS.
@@ -90,7 +123,13 @@ app.post('/login', (req, res) => {
 // Gate runs before static + page routes. Unauthed hits to a protected
 // page bounce to /login (preserving where they were headed).
 app.use((req, res, next) => {
-  const p = req.path;
+  // Normalize before checking: Express routes case-insensitively and
+  // ignores trailing slashes by default, so "/User", "/USER.HTML" and
+  // "/user/" all reached the protected handlers while sailing straight
+  // past a raw req.path Set lookup — a full auth bypass. Lowercase and
+  // strip trailing slashes so the gate sees what the router sees.
+  let p = req.path.toLowerCase().replace(/\/+$/, '');
+  if (p === '') p = '/';
   // /api/* and /turn-credentials proxy PAID services (Anthropic via
   // T1_PROMPT_KEY; metered.live TURN) with no auth of their own. Anyone on
   // the internet could POST /api/t1 or /api/vision to burn Claude credits, or
@@ -661,10 +700,20 @@ app.get('/cli', (req, res) => {
 });
 
 app.get("/turn-credentials", async (req, res) => {
-  const resp = await fetch(
-    `https://laira.metered.live/api/v1/turn/credentials?apiKey=${process.env.METERED_API_KEY}`
-  );
-  res.json(await resp.json());
+  // try/catch: an unhandled rejection here (metered.live down, DNS blip)
+  // used to leave the request hanging and spray UnhandledPromiseRejection.
+  try {
+    const resp = await fetch(
+      `https://laira.metered.live/api/v1/turn/credentials?apiKey=${process.env.METERED_API_KEY}`
+    );
+    if (!resp.ok) {
+      return res.status(502).json({ error: 'turn_upstream', status: resp.status });
+    }
+    res.json(await resp.json());
+  } catch (err) {
+    console.error('/turn-credentials error', err);
+    res.status(502).json({ error: 'turn_fetch_failed', detail: String(err) });
+  }
 });
 
 // Create HTTP server and WebSocket server
@@ -706,8 +755,30 @@ function broadcastToUsers(message, opts = {}) {
   }
 }
 
+// Per-message relay logging is gated: keystates arrive at up to 60/s per
+// driving client and logging each one chewed Render's log quota + CPU.
+// Set DEBUG_WS=1 in the environment to turn the firehose back on.
+const DEBUG_WS = process.env.DEBUG_WS === '1';
+let _laiRAGateWarned = false;
+
 wss.on('connection', (ws, req) => {
-  if (req.url === '/user') {
+  // Parse the path properly: req.url includes any query string, so the
+  // old exact-match (`req.url === '/user'`) silently ignored connections
+  // like '/user?x=1' (socket left open with NO handlers — a leak) and
+  // gave the Pi no way to pass a device key on /laiRA.
+  let pathname = req.url || '/';
+  let query = new URLSearchParams('');
+  try {
+    const u = new URL(req.url, 'http://placeholder');
+    pathname = u.pathname;
+    query = u.searchParams;
+  } catch (e) { /* keep raw url */ }
+
+  // Auth helper for non-browser WS clients (CLI on /forward, recorders on
+  // /audio-stream): accept the passkey cookie OR ?key=<passkey>.
+  const hasKeyOrCookie = () => isAuthed(req) || query.get('key') === LAIRA_PASSKEY;
+
+  if (pathname === '/user') {
     // Gate the control channel: a browser must carry the passkey cookie
     // (set after /login). The Pi connects on /laiRA, not here, so it's
     // unaffected. This is what actually stops an unauthed party from
@@ -740,10 +811,9 @@ wss.on('connection', (ws, req) => {
     }
 
     ws.on('message', (message, isBinary) => {
-      if (isBinary) {
-        console.log('Received binary message from User');
-      } else {
-        console.log('Received from User:', message);
+      if (DEBUG_WS) {
+        if (isBinary) console.log('Received binary message from User');
+        else console.log('Received from User:', message.toString().slice(0, 200));
       }
 
       // Forward message to LaiRA if connected
@@ -767,7 +837,20 @@ wss.on('connection', (ws, req) => {
       }
       console.log(`User disconnected (${userSockets.size} remaining)`);
     });
-  } else if (req.url === '/laiRA') {
+  } else if (pathname === '/laiRA') {
+    // Device gate (opt-in): when DEVICE_KEY is set on Render, only a
+    // client presenting ?key=<DEVICE_KEY> may claim the robot slot.
+    if (DEVICE_KEY) {
+      if (query.get('key') !== DEVICE_KEY) {
+        console.log('laiRA connection REJECTED (bad/missing device key)');
+        try { ws.close(1008, 'device key required'); } catch (e) {}
+        return;
+      }
+    } else if (!_laiRAGateWarned) {
+      _laiRAGateWarned = true;
+      console.warn('[security] /laiRA is UNAUTHENTICATED — set DEVICE_KEY on Render '
+        + 'and LAIRA_DEVICE_KEY on the Pi to lock the robot slot.');
+    }
     laiRASocket = ws;
     console.log('LaiRA connected');
 
@@ -793,10 +876,9 @@ wss.on('connection', (ws, req) => {
     }, 15000);
 
     laiRASocket.on('message', (message, isBinary) => {
-      if (isBinary) {
-        console.log('Received binary message from LaiRA');
-      } else {
-        console.log('Received from LaiRA:', message);
+      if (DEBUG_WS) {
+        if (isBinary) console.log('Received binary message from LaiRA');
+        else console.log('Received from LaiRA:', message.toString().slice(0, 200));
       }
 
       // Forward to EVERY connected user (was previously only the most-
@@ -822,17 +904,19 @@ wss.on('connection', (ws, req) => {
       // and video/control just stops working until manual restart.
       broadcastToUsers(JSON.stringify({ type: 'laiRA-disconnected' }));
     });
-  } else if (req.url === '/forward') {
-    // Handle connections to WebSocket B
+  } else if (pathname === '/forward') {
+    // CLI clients receive every relayed chat-message (incl. STT
+    // transcripts and user commands) — gate it like everything else.
+    // Non-browser clients can pass ?key=<passkey> instead of the cookie.
+    if (!hasKeyOrCookie()) {
+      try { ws.close(1008, 'auth required'); } catch (e) {}
+      return;
+    }
     console.log('Forward client connected');
     forwardSocketSet.add(ws);
 
     ws.on('message', (message, isBinary) => {
-      if (isBinary) {
-        console.log('Received binary message from Forward client');
-      } else {
-        console.log('Received from Forward client:', message);
-      }
+      if (DEBUG_WS) console.log('Received from Forward client:', message.toString().slice(0, 200));
       // If needed, handle messages from CLI clients
     });
 
@@ -840,56 +924,86 @@ wss.on('connection', (ws, req) => {
       console.log('Forward client disconnected');
       forwardSocketSet.delete(ws);
     });
-  } else if (req.url === '/audio-stream') {
-  console.log('Audio stream connected');
+  } else if (pathname === '/audio-stream') {
+    // Streams browser-mic PCM into Rev.ai on OUR token — gate it, check
+    // the token exists, and contain Rev.ai failures. Previously: no auth
+    // (anyone could burn Rev.ai minutes), and a missing token or an
+    // unhandled 'error' event on the stream would CRASH the whole server
+    // (unhandled exception in the connection handler / EventEmitter).
+    if (!hasKeyOrCookie()) {
+      try { ws.close(1008, 'auth required'); } catch (e) {}
+      return;
+    }
+    const token = process.env.REVAI_ACCESS_TOKEN;
+    if (!token) {
+      console.warn('/audio-stream rejected: REVAI_ACCESS_TOKEN not set');
+      try { ws.close(1011, 'stt not configured'); } catch (e) {}
+      return;
+    }
+    console.log('Audio stream connected');
 
-  // Configure Rev.ai audio
-  const audioConfig = new revai.AudioConfig(
-    "audio/x-raw",   // MIME
-    "interleaved",   // layout
-    48000,           // sample rate Hz 
-    "S16LE",         // format
-    1                // channels
-  );
-
-  const token = process.env.REVAI_ACCESS_TOKEN; // set this in env
-  const client = new revai.RevAiStreamingClient(token, audioConfig);
-  const revStream = client.start();
-
-  // Forward Rev.ai transcripts back to user.html
-  revStream.on('data', (data) => {
+    let client = null;
+    let revStream = null;
     try {
-      const parsed = JSON.parse(data.toString());
-      if (parsed.type === "final") {
-        // Previously sent to one userSocket; now fan out to all connected users.
-        broadcastToUsers(JSON.stringify({ type: "voice-transcript", data: parsed }));
-      }
+      // Configure Rev.ai audio
+      const audioConfig = new revai.AudioConfig(
+        "audio/x-raw",   // MIME
+        "interleaved",   // layout
+        48000,           // sample rate Hz
+        "S16LE",         // format
+        1                // channels
+      );
+      client = new revai.RevAiStreamingClient(token, audioConfig);
+      client.on('error', (err) => console.error('Rev.ai client error', err));
+      revStream = client.start();
     } catch (err) {
-      console.error("Error parsing Rev.ai data", err, data.toString());
+      console.error('Rev.ai init failed', err);
+      try { ws.close(1011, 'stt init failed'); } catch (e) {}
+      return;
     }
-  });
 
-  revStream.on('end', () => {
-    console.log("Rev.ai stream ended");
-  });
+    revStream.on('error', (err) => {
+      console.error('Rev.ai stream error', err);
+      try { ws.close(1011, 'stt stream error'); } catch (e) {}
+    });
 
-  ws.on('message', (message, isBinary) => {
-    if (isBinary) {
-      // PCM audio chunk
-      revStream.write(message);
-    } else {
-      console.log("Non-binary message on /audio-stream", message.toString());
-    }
-  });
+    // Forward Rev.ai transcripts back to user.html
+    revStream.on('data', (data) => {
+      try {
+        const parsed = JSON.parse(data.toString());
+        if (parsed.type === "final") {
+          // Previously sent to one userSocket; now fan out to all connected users.
+          broadcastToUsers(JSON.stringify({ type: "voice-transcript", data: parsed }));
+        }
+      } catch (err) {
+        console.error("Error parsing Rev.ai data", err, data.toString());
+      }
+    });
 
-  ws.on('close', () => {
-    console.log("Audio stream disconnected");
-    client.end();
-  });
-}
+    revStream.on('end', () => {
+      console.log("Rev.ai stream ended");
+    });
 
+    ws.on('message', (message, isBinary) => {
+      if (isBinary) {
+        // PCM audio chunk
+        try { revStream.write(message); }
+        catch (err) { console.error('revStream.write failed', err); }
+      } else if (DEBUG_WS) {
+        console.log("Non-binary message on /audio-stream", message.toString().slice(0, 200));
+      }
+    });
 
-  
+    ws.on('close', () => {
+      console.log("Audio stream disconnected");
+      try { client.end(); } catch (e) {}
+    });
+  } else {
+    // Unknown WS path: close it. Previously these sockets were accepted
+    // and left dangling forever with no handlers attached — a quiet
+    // resource leak and a confusing "connected but dead" client state.
+    try { ws.close(1008, 'unknown path'); } catch (e) {}
+  }
 });
 
 // Function to forward only chat messages to CLI clients

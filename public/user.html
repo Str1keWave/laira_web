@@ -382,12 +382,25 @@
 
       const keyStates = { w: false, a: false, s: false, d: false, q: false, e: false };
 
+      // Dedup: this used to transmit the full keystate payload on EVERY
+      // animation frame (60/s — 144+/s on high-refresh monitors), all of it
+      // relayed through Render to the Pi even when nothing changed. Now we
+      // send only when the keystates actually change, plus a 1s refresh so
+      // the Pi re-syncs if a packet was lost.
+      let _lastKsSig = "";
+      let _lastKsSentAt = 0;
       function sendKeyStates() {
         if (userSocketA.readyState === WebSocket.OPEN && !aiFollowMode) {
           const ks = {};
           for (const k in keyStates) ks[k] = keyStates[k] ? "True" : "False";
           if (!stopSend) {
-            userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ keystates: ks }) }));
+            const sig = JSON.stringify(ks);
+            const now = performance.now();
+            if (sig !== _lastKsSig || now - _lastKsSentAt > 1000) {
+              _lastKsSig = sig;
+              _lastKsSentAt = now;
+              userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ keystates: ks }) }));
+            }
           }
         }
       }
@@ -395,6 +408,10 @@
       userSocketA.addEventListener("open", () => { rafId = requestAnimationFrame(animationLoop); });
 
       document.addEventListener("keydown", e=>{
+        // Don't drive the robot while typing in the chat box — without
+        // this guard, every w/a/s/d typed into a message walked her and
+        // the letter "l" made her lie down.
+        if (document.activeElement === document.getElementById("userMessage")) return;
         const k=e.key.toLowerCase();
         if (e.key.toLowerCase() === 'l' && !aiFollowMode) runCustomAnimations('lie down');
         if(k in keyStates && !aiFollowMode){
@@ -408,7 +425,10 @@
         if (aiFollowMode) return;
         const txt = document.getElementById("userMessage").value.trim();
         if (txt) {
-          userSocketA.send(JSON.stringify({ type: "chat-message", message: txt }));
+          // Wrap as {user_text:...} — the Pi json-parses the inner message,
+          // so raw text either did nothing or (worse) substring-matched a
+          // control word: typing anything containing "rest" cut motor power.
+          userSocketA.send(JSON.stringify({ type: "chat-message", message: JSON.stringify({ user_text: txt }) }));
           document.getElementById("userMessage").value = "";
         }
       }
