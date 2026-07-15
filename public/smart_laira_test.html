@@ -578,7 +578,7 @@
       try {
         const resp = await fetch('/turn-credentials');
         const iceServers = await resp.json();
-        pi.peerConnection = new RTCPeerConnection({ iceServers }  /* WS-FLAP FIX 2026-07-14: allow direct LAN path, TURN fallback */);
+        pi.peerConnection = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' });
         pi.peerConnection.addTransceiver('video', { direction: 'recvonly' });
         pi.peerConnection.addTransceiver('audio', { direction: 'recvonly' });
 

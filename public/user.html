@@ -662,7 +662,7 @@
         try {
           const resp = await fetch("/turn-credentials");
           const iceServers = await resp.json();
-          peerConnection = new RTCPeerConnection({ iceServers }  /* WS-FLAP FIX 2026-07-14: was iceTransportPolicy:"relay" (forced ALL media through metered TURN relay, which cut allocations at ~5s -> connect/disconnect loop). Default "all" lets ICE use a DIRECT LAN path (host candidates) and only fall back to TURN when remote. */);
+          peerConnection = new RTCPeerConnection({ iceServers, iceTransportPolicy: "relay" });
           peerConnection.addTransceiver("video", { direction: "recvonly" });
           peerConnection.addTransceiver("audio", { direction: "recvonly" });
 
