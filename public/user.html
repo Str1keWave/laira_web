@@ -607,17 +607,37 @@
 
       userSocketA.addEventListener("open", () => { console.log("Socket A connected"); });
       // userSocketB.addEventListener("open", () => console.log("Socket B connected"));
+      // ── FLAP-DEBUG 2026-07-15 (log-only): console + on-page overlay ──
+      const _dbgBox = document.createElement('div');
+      _dbgBox.style.cssText = 'position:fixed;bottom:0;left:0;right:0;max-height:130px;overflow:hidden;background:rgba(0,0,0,.75);color:#8f8;font:10px monospace;padding:2px 6px;z-index:9999;pointer-events:none;white-space:pre;';
+      document.body.appendChild(_dbgBox);
+      const _dbgLines = [];
+      function dbgLog(msg) {
+        const t = new Date().toISOString().slice(11, 23);
+        const line = `[${t}] ${msg}`;
+        console.log('[dbg]', line);
+        _dbgLines.unshift(line);
+        if (_dbgLines.length > 9) _dbgLines.pop();
+        _dbgBox.textContent = _dbgLines.join('
+');
+      }
+      dbgLog('flap-debug active');
+      userSocketA.addEventListener('open',  () => dbgLog('socketA OPEN'));
+      userSocketA.addEventListener('close', (e) => dbgLog(`socketA CLOSE code=${e.code}`));
+      userSocketA.addEventListener('error', () => dbgLog('socketA ERROR'));
       let handshakeTimer = null;
       userSocketA.addEventListener("message", async (event) => {
         try {
           const data = await (event.data instanceof Blob ? event.data.text() : event.data);
           const parsed = JSON.parse(data);
           if (parsed.type === "laiRA-connected") {
+            dbgLog(`laiRA-connected rx (pc=${peerConnection ? peerConnection.connectionState : 'none'})`);
             if (handshakeTimer) clearTimeout(handshakeTimer);
             handshakeTimer = setTimeout(() => {
               handshakeTimer = null;
-              if (peerConnection) { console.log("🗑 closing old PeerConnection"); peerConnection.close(); peerConnection = null; remoteDescriptionSet = false; candidateQueue = []; }
+              if (peerConnection) { dbgLog(`REBUILD: closing PC (was ${peerConnection.connectionState})`); console.log("🗑 closing old PeerConnection"); peerConnection.close(); peerConnection = null; remoteDescriptionSet = false; candidateQueue = []; }
               console.log("🚀 starting new handshake");
+              dbgLog('offer: starting new handshake');
               startPeerConnection();
             }, 200);
           } else if (parsed.type === "laiRA-disconnected") {
@@ -626,6 +646,7 @@
             // to reuse a half-dead PC. Without this, a Pi restart could
             // leave the browser's PC in a state where it ignores the
             // reconnect broadcast and video/control silently stops.
+            dbgLog(`laiRA-disconnected rx (pc=${peerConnection ? peerConnection.connectionState : "none"})`);
             console.log("🔌 LaiRA disconnected — tearing down PC");
             if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
             if (peerConnection) {
@@ -663,6 +684,8 @@
           const resp = await fetch("/turn-credentials");
           const iceServers = await resp.json();
           peerConnection = new RTCPeerConnection({ iceServers, iceTransportPolicy: "relay" });
+          peerConnection.addEventListener('connectionstatechange', () => dbgLog(`pc conn=${peerConnection ? peerConnection.connectionState : '?'}`));
+          peerConnection.addEventListener('iceconnectionstatechange', () => dbgLog(`pc ice=${peerConnection ? peerConnection.iceConnectionState : '?'}`));
           peerConnection.addTransceiver("video", { direction: "recvonly" });
           peerConnection.addTransceiver("audio", { direction: "recvonly" });
 

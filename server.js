@@ -684,19 +684,31 @@ app.post('/api/t1', async (req, res) => {
   }
 });
 
-// Serve user and laira pages at '/user' and '/laira'
+// Serve the user pages.
 app.get('/user', (req, res) => {
   res.sendFile(__dirname + '/public/user.html');
 });
 app.get('/user2', (req, res) => {
   res.sendFile(__dirname + '/public/user2.html');
 });
-app.get('/laira', (req, res) => {
-  res.sendFile(__dirname + '/public/laira.html');
-});
+// /laira (legacy WebRTC test simulator) removed 2026-06-09 — it connected
+// to the unauthenticated /laiRA socket and could hijack the robot slot.
 // Serve the CLI page
 app.get('/cli', (req, res) => {
   res.sendFile(__dirname + '/public/cli_page.html');
+});
+
+app.get('/debug-events', (req, res) => {
+  // FLAP-DEBUG: gated by the metered key (already secret on both Render + Pi).
+  if ((req.query.key || '') !== (process.env.METERED_API_KEY || '__unset__')) {
+    return res.status(401).json({ error: 'no' });
+  }
+  res.json({
+    now: Date.now(),
+    userTabs: userSockets.size,
+    lairaConnected: !!(laiRASocket && laiRASocket.readyState === 1),
+    events: dbgEvents,
+  });
 });
 
 app.get("/turn-credentials", async (req, res) => {
@@ -759,6 +771,39 @@ function broadcastToUsers(message, opts = {}) {
 // driving client and logging each one chewed Render's log quota + CPU.
 // Set DEBUG_WS=1 in the environment to turn the firehose back on.
 const DEBUG_WS = process.env.DEBUG_WS === '1';
+
+// ── FLAP-DEBUG 2026-07-15 (log-only instrumentation) ────────────────────────
+// Millisecond-timestamped ring of connection-lifecycle events, readable at
+// GET /debug-events?key=<METERED_API_KEY>. Zero behavior change — purely to
+// capture the causal order of the connect/disconnect oscillation.
+const dbgEvents = [];
+let _dbgUserSeq = 0;
+function dbg(tag, detail) {
+  const e = { ms: Date.now(), t: new Date().toISOString().slice(11, 23), tag, detail: detail === undefined ? null : detail };
+  dbgEvents.push(e);
+  if (dbgEvents.length > 500) dbgEvents.shift();
+  console.log(`[dbg ${e.t}] ${tag}${detail !== undefined ? ' ' + JSON.stringify(detail) : ''}`);
+}
+function dbgClassify(message, isBinary) {
+  // Cheap signaling-type sniff for the relay paths (offers/answers/ICE are
+  // rare; keystates are summarized, media is binary-skipped).
+  if (isBinary) return null;
+  try {
+    const s0 = message.toString();
+    if (s0.length > 4000) return null;
+    const m = JSON.parse(s0);
+    if (m.type === 'offer' || m.type === 'answer') return m.type;
+    if (m.type === 'ice-candidate') return 'ice';
+    if (m.type === 'chat-message') {
+      const inner = typeof m.message === 'string' ? m.message : '';
+      if (inner.includes('keystates')) return null; // too chatty; counted elsewhere
+      if (inner.includes('policymode') || inner.includes('user_text')) return 'chat:user_text';
+      return null;
+    }
+  } catch (e) {}
+  return null;
+}
+
 let _laiRAGateWarned = false;
 
 wss.on('connection', (ws, req) => {
@@ -789,6 +834,8 @@ wss.on('connection', (ws, req) => {
     }
     userSockets.add(ws);
     userSocket = ws;
+    ws._dbgId = 'u' + (++_dbgUserSeq);
+    dbg('user-connect', { id: ws._dbgId, tabs: userSockets.size });
     console.log(`User connected (${userSockets.size} total)`);
 
     // Heartbeat to the browser every 10s. The /user link can go half-open on
@@ -817,6 +864,8 @@ wss.on('connection', (ws, req) => {
       }
 
       // Forward message to LaiRA if connected
+      const _k = dbgClassify(message, isBinary);
+      if (_k) dbg('user->pi:' + _k, { id: ws._dbgId });
       if (laiRASocket && laiRASocket.readyState === WebSocket.OPEN) {
         laiRASocket.send(message, { binary: isBinary });
       }
@@ -835,6 +884,7 @@ wss.on('connection', (ws, req) => {
         userSocket = null;
         for (const s of userSockets) { userSocket = s; break; }
       }
+      dbg('user-close', { id: ws._dbgId, tabs: userSockets.size });
       console.log(`User disconnected (${userSockets.size} remaining)`);
     });
   } else if (pathname === '/laiRA') {
@@ -852,6 +902,7 @@ wss.on('connection', (ws, req) => {
         + 'and LAIRA_DEVICE_KEY on the Pi to lock the robot slot.');
     }
     laiRASocket = ws;
+    dbg('pi-connect', { tabs: userSockets.size });
     console.log('LaiRA connected');
 
     // Notify every connected user that LaiRA is (re)online.
@@ -883,6 +934,8 @@ wss.on('connection', (ws, req) => {
 
       // Forward to EVERY connected user (was previously only the most-
       // recent one, which broke multi-tab and test-harness scenarios).
+      const _k2 = dbgClassify(message, isBinary);
+      if (_k2) dbg('pi->users:' + _k2, { tabs: userSockets.size });
       broadcastToUsers(message, { binary: isBinary });
 
       // Forward only text chat messages to CLI clients
@@ -891,8 +944,9 @@ wss.on('connection', (ws, req) => {
       }
     });
 
-    laiRASocket.on('close', () => {
+    laiRASocket.on('close', (code, reason) => {
       clearInterval(aliveTimer);
+      dbg('pi-close', { code, reason: String(reason || '').slice(0, 60), tabs: userSockets.size });
       console.log('LaiRA disconnected');
       laiRASocket = null;
       // Tell every connected browser the Pi went away so they can tear
