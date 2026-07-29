@@ -282,6 +282,11 @@
       <input id="gaitSpeedSlider" type="range" min="5" max="40" step="1" value="20" />
       <span class="val" id="gaitSpeedVal">20</span>
     </div>
+    <div class="slider-cell">
+      <label for="heightSlider" title="standing/walking height in mm (Pi 'BASE_HEIGHT'; default 150). Pi ramps to the new height smoothly (~90mm/s), no slam.">height</label>
+      <input id="heightSlider" type="range" min="100" max="240" step="1" value="150" />
+      <span class="val" id="heightVal">150</span>
+    </div>
     <div class="toggle-cell">
       <input id="bboxToggle" type="checkbox" />
       <label for="bboxToggle">show SAMURAI bbox</label>
@@ -535,7 +540,7 @@
             // Gait sliders re-sync too — the Pi resets stride/lift/gait
             // speed to defaults on service restart; without this a slider
             // showing 40 would silently walk her at 20.
-            sendChatToPi({ gait_params: { stride: currentStride, lift: currentLift, speed: currentGaitSpeed } });
+            sendChatToPi({ gait_params: { stride: currentStride, lift: currentLift, speed: currentGaitSpeed, height: currentHeight } });
           } catch (_) { /* elements may not be bound yet on very-early hello */ }
         } else if (parsed.type === 'laira-log') {
           const level = parsed.level || 'evt';
@@ -862,8 +867,10 @@
     const $liftVal         = document.getElementById('liftVal');
     const $gaitSpeedSlider = document.getElementById('gaitSpeedSlider');
     const $gaitSpeedVal    = document.getElementById('gaitSpeedVal');
+    const $heightSlider    = document.getElementById('heightSlider');
+    const $heightVal       = document.getElementById('heightVal');
 
-    let currentStride = 30, currentLift = 20, currentGaitSpeed = 20;
+    let currentStride = 30, currentLift = 20, currentGaitSpeed = 20, currentHeight = 150;
     let gaitParamsTimer = null;
 
     function pushGaitParams() {
@@ -871,6 +878,7 @@
       gaitParamsTimer = setTimeout(() => {
         sendChatToPi({ gait_params: {
           stride: currentStride, lift: currentLift, speed: currentGaitSpeed,
+          height: currentHeight,
         } });
       }, 150);
     }
@@ -888,6 +896,11 @@
     $gaitSpeedSlider.addEventListener('input', () => {
       currentGaitSpeed = parseInt($gaitSpeedSlider.value, 10);
       $gaitSpeedVal.textContent = String(currentGaitSpeed);
+      pushGaitParams();
+    });
+    $heightSlider.addEventListener('input', () => {
+      currentHeight = parseInt($heightSlider.value, 10);
+      $heightVal.textContent = String(currentHeight);
       pushGaitParams();
     });
     $bboxToggle.addEventListener('change', () => {
