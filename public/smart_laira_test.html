@@ -267,6 +267,21 @@
       <input id="closenessSlider" type="range" min="1" max="8" step="1" value="3" />
       <span class="val" id="closenessVal">3</span>
     </div>
+    <div class="slider-cell">
+      <label for="strideSlider" title="gait stride half-length in mm (Pi 'bounds'; default 30)">stride</label>
+      <input id="strideSlider" type="range" min="10" max="45" step="1" value="30" />
+      <span class="val" id="strideVal">30</span>
+    </div>
+    <div class="slider-cell">
+      <label for="liftSlider" title="paw lift height in mm during the swing phase (Pi 'max_z'; default 20)">lift</label>
+      <input id="liftSlider" type="range" min="5" max="35" step="1" value="20" />
+      <span class="val" id="liftVal">20</span>
+    </div>
+    <div class="slider-cell">
+      <label for="gaitSpeedSlider" title="gait step size per tick (Pi 'gait_speed'; default 20). Different from the 'speed' slider above, which scales the tick RATE.">gait&nbsp;speed</label>
+      <input id="gaitSpeedSlider" type="range" min="5" max="40" step="1" value="20" />
+      <span class="val" id="gaitSpeedVal">20</span>
+    </div>
     <div class="toggle-cell">
       <input id="bboxToggle" type="checkbox" />
       <label for="bboxToggle">show SAMURAI bbox</label>
@@ -517,6 +532,10 @@
             sendChatToPi({ stt_to_brain: $sttToBrainToggle.checked });
             sendChatToPi({ bbox_stream: $bboxToggle.checked });
             sendChatToPi({ brain_params: { speed: currentSpeed, closeness: currentCloseness } });
+            // Gait sliders re-sync too — the Pi resets stride/lift/gait
+            // speed to defaults on service restart; without this a slider
+            // showing 40 would silently walk her at 20.
+            sendChatToPi({ gait_params: { stride: currentStride, lift: currentLift, speed: currentGaitSpeed } });
           } catch (_) { /* elements may not be bound yet on very-early hello */ }
         } else if (parsed.type === 'laira-log') {
           const level = parsed.level || 'evt';
@@ -829,6 +848,47 @@
       currentCloseness = parseInt($closenessSlider.value, 10);
       $closenessVal.textContent = String(currentCloseness);
       pushBrainParams();
+    });
+
+    // ── Gait-parameter sliders (stride / lift / gait speed) ─────────────
+    // These map straight onto the Pi gait engine's live globals: stride →
+    // bounds (sweep half-length, mm), lift → max_z (paw lift, mm), speed →
+    // gait_speed (step size per tick). The Pi reads them mid-stride, so
+    // dragging while she walks changes the gait in real time. Debounced
+    // ~150ms so a drag doesn't flood the WS with one message per pixel.
+    const $strideSlider    = document.getElementById('strideSlider');
+    const $strideVal       = document.getElementById('strideVal');
+    const $liftSlider      = document.getElementById('liftSlider');
+    const $liftVal         = document.getElementById('liftVal');
+    const $gaitSpeedSlider = document.getElementById('gaitSpeedSlider');
+    const $gaitSpeedVal    = document.getElementById('gaitSpeedVal');
+
+    let currentStride = 30, currentLift = 20, currentGaitSpeed = 20;
+    let gaitParamsTimer = null;
+
+    function pushGaitParams() {
+      clearTimeout(gaitParamsTimer);
+      gaitParamsTimer = setTimeout(() => {
+        sendChatToPi({ gait_params: {
+          stride: currentStride, lift: currentLift, speed: currentGaitSpeed,
+        } });
+      }, 150);
+    }
+
+    $strideSlider.addEventListener('input', () => {
+      currentStride = parseInt($strideSlider.value, 10);
+      $strideVal.textContent = String(currentStride);
+      pushGaitParams();
+    });
+    $liftSlider.addEventListener('input', () => {
+      currentLift = parseInt($liftSlider.value, 10);
+      $liftVal.textContent = String(currentLift);
+      pushGaitParams();
+    });
+    $gaitSpeedSlider.addEventListener('input', () => {
+      currentGaitSpeed = parseInt($gaitSpeedSlider.value, 10);
+      $gaitSpeedVal.textContent = String(currentGaitSpeed);
+      pushGaitParams();
     });
     $bboxToggle.addEventListener('change', () => {
       showBbox = $bboxToggle.checked;
